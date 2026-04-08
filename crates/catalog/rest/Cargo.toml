@@ -32,13 +32,13 @@ repository = { workspace = true }
 async-trait = { workspace = true }
 base64 = "0.22"
 chrono = { workspace = true }
-gcp_auth = { version = "0.12", features = ["webpki-roots", "ring"] }
+google-cloud-auth = { package = "gcloud-auth", version = "1.0.2" }
 http = { workspace = true }
 iceberg = { workspace = true }
 itertools = { workspace = true }
 reqwest = { workspace = true }
-rustls = { version = "0.23", features = ["ring"] }
 serde = { workspace = true }
+token-source = "1.0"
 serde_derive = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true, features = ["sync"] }
