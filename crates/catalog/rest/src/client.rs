@@ -26,6 +26,7 @@ use reqwest::{Client, IntoUrl, Method, Request, RequestBuilder, Response};
 use serde::de::DeserializeOwned;
 use tokio::sync::Mutex;
 
+use crate::auth::GoogleAuthManager;
 use crate::types::{ErrorResponse, TokenResponse};
 use crate::{GCP_CLOUD_PLATFORM_SCOPE, RestCatalogConfig};
 
@@ -48,6 +49,8 @@ pub(crate) struct HttpClient {
     disable_header_redaction: bool,
     /// GCP service account JSON for authentication.
     gcp_credential: Option<String>,
+    /// Google ADC auth manager (when security=google)
+    google_auth_manager: Option<GoogleAuthManager>,
 }
 
 impl Debug for HttpClient {
@@ -62,6 +65,15 @@ impl Debug for HttpClient {
 impl HttpClient {
     /// Create a new http client.
     pub fn new(cfg: &RestCatalogConfig) -> Result<Self> {
+        let google_auth_manager = if cfg.google_auth() {
+            Some(GoogleAuthManager::new(
+                cfg.google_credentials_json().clone(),
+                None,
+            ))
+        } else {
+            None
+        };
+
         Ok(HttpClient {
             client: cfg.client().unwrap_or_default(),
             token: Mutex::new(cfg.token()),
@@ -71,6 +83,7 @@ impl HttpClient {
             extra_oauth_params: cfg.extra_oauth_params(),
             disable_header_redaction: cfg.disable_header_redaction(),
             gcp_credential: cfg.gcp_credential(),
+            google_auth_manager,
         })
     }
 
@@ -101,6 +114,14 @@ impl HttpClient {
             },
             disable_header_redaction: cfg.disable_header_redaction(),
             gcp_credential: cfg.gcp_credential().or(self.gcp_credential),
+            google_auth_manager: if cfg.google_auth() {
+                Some(GoogleAuthManager::new(
+                    cfg.google_credentials_json().clone(),
+                    None,
+                ))
+            } else {
+                None
+            },
         })
     }
 
@@ -113,6 +134,11 @@ impl HttpClient {
             .unwrap();
         self.authenticate(&mut req).await.ok();
         self.token.lock().await.clone()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_google_auth(&self) -> bool {
+        self.google_auth_manager.is_some()
     }
 
     async fn exchange_credential_for_token(&self) -> Result<String> {
@@ -247,14 +273,20 @@ impl HttpClient {
     /// 2. **Token authentication** - Use the provided `token` directly for authentication.
     /// 3. **OAuth authentication** - Exchange `credential` for a token, cache it, then use it for authentication.
     /// 4. **GCP Service Account** - Use GCP service account to get access token.
+    /// 5. **Google ADC** - Use Google ADC (Application Default Credentials) when google-auth=true.
     ///
     /// When both `credential` and `token` are present, `token` takes precedence.
-    /// When GCP service account is present, it takes precedence over credential-based auth.
+    /// When GCP service account is present, it takes precedence over other auth methods.
+    /// When Google ADC is configured (google-auth=true), it is used after GCP SA.
     async fn authenticate(&self, req: &mut Request) -> Result<()> {
         // Clone the token from lock without holding the lock for entire function.
         let token = self.token.lock().await.clone();
 
-        if self.credential.is_none() && token.is_none() && self.gcp_credential.is_none() {
+        if self.credential.is_none()
+            && token.is_none()
+            && self.gcp_credential.is_none()
+            && self.google_auth_manager.is_none()
+        {
             return Ok(());
         }
 
@@ -262,7 +294,27 @@ impl HttpClient {
         let token = match token {
             Some(token) => token,
             None => {
-                let token = self.exchange_token().await?;
+                let token = if let Some(ref gcp_cred) = self.gcp_credential {
+                    if !gcp_cred.is_empty() {
+                        self.exchange_gcp_credential_for_token().await?
+                    } else if self.google_auth_manager.is_some() {
+                        self.google_auth_manager
+                            .as_ref()
+                            .unwrap()
+                            .get_token()
+                            .await?
+                    } else {
+                        self.exchange_credential_for_token().await?
+                    }
+                } else if self.google_auth_manager.is_some() {
+                    self.google_auth_manager
+                        .as_ref()
+                        .unwrap()
+                        .get_token()
+                        .await?
+                } else {
+                    self.exchange_token().await?
+                };
                 // Update token so that we use it for next request instead of
                 // exchanging credential for token from the server again
                 *self.token.lock().await = Some(token.clone());

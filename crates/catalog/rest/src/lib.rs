@@ -51,6 +51,7 @@
 
 #![deny(missing_docs)]
 
+mod auth;
 mod catalog;
 mod client;
 mod types;
