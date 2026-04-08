@@ -65,6 +65,11 @@ pub const GCS_CREDENTIALS_JSON: &str = "gcs.credentials-json";
 /// OAuth2 scope for Google Cloud Platform API access.
 pub(crate) const GCP_CLOUD_PLATFORM_SCOPE: &str = "https://www.googleapis.com/auth/cloud-platform";
 
+/// Google auth property key (use Google ADC when true)
+pub const GOOGLE_AUTH_PROP: &str = "google-auth";
+/// Google credentials JSON property key
+pub const GOOGLE_CREDENTIALS_JSON: &str = "google.credentials-json";
+
 /// Builder for [`RestCatalog`].
 #[derive(Debug)]
 pub struct RestCatalogBuilder(RestCatalogConfig);
@@ -334,6 +339,17 @@ impl RestCatalogConfig {
 
         // Fall back to treating it as plain JSON
         Some(value.clone())
+    }
+
+    pub(crate) fn google_auth(&self) -> bool {
+        self.props
+            .get(GOOGLE_AUTH_PROP)
+            .map(|v| v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+    }
+
+    pub(crate) fn google_credentials_json(&self) -> Option<String> {
+        self.props.get(GOOGLE_CREDENTIALS_JSON).cloned()
     }
 
     /// Merge the `RestCatalogConfig` with the a [`CatalogConfig`] (fetched from the REST server).
@@ -729,7 +745,7 @@ impl Catalog for RestCatalog {
                 schema: creation.schema,
                 partition_spec: creation.partition_spec,
                 write_order: creation.sort_order,
-                stage_create: Some(false),
+                stage_create: None,
                 properties: creation.properties,
             })
             .build()?;
@@ -2891,5 +2907,44 @@ mod tests {
             assert_eq!(err.kind(), ErrorKind::DataInvalid);
             assert_eq!(err.message(), "Catalog uri is required");
         }
+    }
+
+    #[tokio::test]
+    async fn test_google_auth_enabled() {
+        let builder = RestCatalogBuilder::default();
+        let catalog = builder
+            .load(
+                "test",
+                HashMap::from([
+                    (
+                        REST_CATALOG_PROP_URI.to_string(),
+                        "http://localhost:8080".to_string(),
+                    ),
+                    (GOOGLE_AUTH_PROP.to_string(), "true".to_string()),
+                ]),
+            )
+            .await;
+
+        assert!(catalog.is_ok());
+    }
+
+    #[test]
+    fn test_google_auth_config_sets_up_auth_manager() {
+        let cfg = RestCatalogConfig::builder()
+            .uri("http://localhost:8080".to_string())
+            .props(HashMap::from([(
+                GOOGLE_AUTH_PROP.to_string(),
+                "true".to_string(),
+            )]))
+            .build();
+        assert!(
+            cfg.google_auth(),
+            "google_auth() should return true when google-auth=true"
+        );
+        let client = HttpClient::new(&cfg).unwrap();
+        assert!(
+            client.has_google_auth(),
+            "HttpClient should have google_auth_manager when google-auth=true"
+        );
     }
 }
