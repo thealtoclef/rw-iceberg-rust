@@ -18,44 +18,26 @@
 //! Google ADC (Application Default Credentials) authentication manager.
 //!
 //! This module provides Google ADC authentication for BigLake/Iceberg REST catalogs.
-//! It uses the `gcp_auth` crate which depends on `hyper-rustls` which depends on `rustls 0.23+`.
+//! It uses the `gcloud-auth` crate which handles token caching and refresh internally.
 
-use std::sync::OnceLock;
-
-use gcp_auth::TokenProvider;
+use google_cloud_auth::credentials::CredentialsFile;
+use google_cloud_auth::project::Config;
+use google_cloud_auth::token::DefaultTokenSourceProvider;
 use iceberg::{Error, ErrorKind, Result};
-
-// rustls 0.23+ requires explicit crypto provider selection when multiple TLS implementations
-// are in the dependency tree. hyper-rustls (used by gcp_auth) depends on rustls 0.23 but
-// doesn't enable a crypto provider feature by default. This can cause a panic at runtime:
-// "Could not automatically determine the process-level CryptoProvider from Rustls crate features."
-//
-// We use OnceLock to ensure the crypto provider is installed exactly once, before any
-// gcp_auth operations. This allows users to use google-auth=true without needing to
-// manually call rustls::crypto::ring::default_provider().install_default() in their code.
-static CRYPTO_PROVIDER_INIT: OnceLock<()> = OnceLock::new();
-
-fn init_crypto_provider() {
-    CRYPTO_PROVIDER_INIT.get_or_init(|| {
-        rustls::crypto::ring::default_provider()
-            .install_default()
-            .expect("Failed to install rustls crypto provider");
-    });
-}
+use token_source::TokenSourceProvider as _;
 
 /// Google ADC authentication manager.
 #[derive(Clone)]
 pub struct GoogleAuthManager {
-    credentials_path: Option<String>,
+    credentials_json: Option<String>,
     scopes: Vec<String>,
 }
 
 impl GoogleAuthManager {
     /// Creates a new `GoogleAuthManager`.
-    pub fn new(credentials_path: Option<String>, scopes: Option<Vec<String>>) -> Self {
-        init_crypto_provider();
+    pub fn new(credentials_json: Option<String>, scopes: Option<Vec<String>>) -> Self {
         Self {
-            credentials_path,
+            credentials_json,
             scopes: scopes.unwrap_or_else(|| {
                 vec!["https://www.googleapis.com/auth/cloud-platform".to_string()]
             }),
@@ -65,41 +47,49 @@ impl GoogleAuthManager {
     /// Get token using Google ADC.
     pub async fn get_token(&self) -> Result<String> {
         let scopes: Vec<&str> = self.scopes.iter().map(|s| s.as_str()).collect();
+        let config = Config::default().with_scopes(&scopes);
 
-        if let Some(ref credentials_path) = self.credentials_path {
-            let custom_sa =
-                gcp_auth::CustomServiceAccount::from_json(credentials_path).map_err(|e| {
-                    Error::new(
-                        ErrorKind::DataInvalid,
-                        format!("Failed to load Google credentials from '{credentials_path}': {e}"),
-                    )
-                })?;
-            let token = custom_sa.token(&scopes).await.map_err(|e| {
+        let provider = if let Some(ref json) = self.credentials_json {
+            let creds = CredentialsFile::new_from_str(json).await.map_err(|e| {
                 Error::new(
                     ErrorKind::DataInvalid,
-                    format!("Failed to get token from service account: {e}"),
+                    format!("Failed to load Google credentials: {e}"),
                 )
             })?;
-            return Ok(token.as_str().to_string());
-        }
+            DefaultTokenSourceProvider::new_with_credentials(config, Box::new(creds))
+                .await
+                .map_err(|e| {
+                    Error::new(
+                        ErrorKind::DataInvalid,
+                        format!("Failed to initialize token source from credentials: {e}"),
+                    )
+                })?
+        } else {
+            DefaultTokenSourceProvider::new(config).await.map_err(|e| {
+                Error::new(
+                    ErrorKind::DataInvalid,
+                    format!(
+                        "Google ADC not configured. Set GOOGLE_APPLICATION_CREDENTIALS \
+                         environment variable or configure a service account. Error: {e}"
+                    ),
+                )
+            })?
+        };
 
-        let provider = gcp_auth::provider().await.map_err(|e| {
-            Error::new(
-                ErrorKind::DataInvalid,
-                format!(
-                    "Google ADC not configured. Set GOOGLE_APPLICATION_CREDENTIALS environment variable or configure a service account. Error: {e}"
-                ),
-            )
-        })?;
-
-        let token = provider.token(&scopes).await.map_err(|e| {
-            Error::new(
-                ErrorKind::DataInvalid,
-                format!("Failed to obtain Google access token via ADC: {e}"),
-            )
-        })?;
-
-        Ok(token.as_str().to_string())
+        // token_source.token() returns "Bearer <access_token>"
+        // Strip the prefix since authenticate() in client.rs adds "Bearer " again.
+        let token = provider
+            .token_source()
+            .token()
+            .await
+            .map_err(|e| {
+                Error::new(
+                    ErrorKind::DataInvalid,
+                    format!("Failed to obtain Google access token: {e}"),
+                )
+            })?;
+        let access_token = token.strip_prefix("Bearer ").unwrap_or(&token).to_string();
+        Ok(access_token)
     }
 }
 
@@ -110,14 +100,13 @@ mod tests {
     #[tokio::test]
     async fn test_google_auth_manager_new() {
         let auth = GoogleAuthManager::new(None, None);
-        assert!(auth.credentials_path.is_none());
+        assert!(auth.credentials_json.is_none());
         assert_eq!(auth.scopes.len(), 1);
     }
 
     #[tokio::test]
     async fn test_invalid_credentials_json_content() {
-        let auth =
-            GoogleAuthManager::new(Some("/nonexistent/path/credentials.json".to_string()), None);
+        let auth = GoogleAuthManager::new(Some("not valid json at all".to_string()), None);
         let result = auth.get_token().await;
         assert!(result.is_err());
         let error = result.unwrap_err();

@@ -18,7 +18,6 @@
 use std::collections::HashMap;
 use std::fmt::{Debug, Formatter};
 
-use gcp_auth::TokenProvider;
 use http::StatusCode;
 use iceberg::{Error, ErrorKind, Result};
 use reqwest::header::HeaderMap;
@@ -209,8 +208,13 @@ impl HttpClient {
         Ok(auth_res.access_token)
     }
 
-    /// Exchange GCP service account for access token using gcp_auth library.
+    /// Exchange GCP service account for access token using google-cloud-auth library.
     async fn exchange_gcp_credential_for_token(&self) -> Result<String> {
+        use google_cloud_auth::credentials::CredentialsFile;
+        use google_cloud_auth::project::Config;
+        use google_cloud_auth::token::DefaultTokenSourceProvider;
+        use token_source::TokenSourceProvider as _;
+
         let service_account_json = self.gcp_credential.as_ref().ok_or_else(|| {
             Error::new(
                 ErrorKind::DataInvalid,
@@ -218,20 +222,31 @@ impl HttpClient {
             )
         })?;
 
-        // Use gcp_auth library to handle authentication
-        let service_account = gcp_auth::CustomServiceAccount::from_json(service_account_json)
+        let creds = CredentialsFile::new_from_str(service_account_json)
+            .await
             .map_err(|e| {
                 Error::new(ErrorKind::DataInvalid, "Invalid GCP service account JSON")
                     .with_source(e)
             })?;
 
-        // Get access token with cloud-platform scope
-        let scopes = &[GCP_CLOUD_PLATFORM_SCOPE];
-        let token = service_account.token(scopes).await.map_err(|e| {
-            Error::new(ErrorKind::Unexpected, "Failed to get GCP access token").with_source(e)
-        })?;
+        let config = Config::default().with_scopes(&[GCP_CLOUD_PLATFORM_SCOPE]);
+        let provider =
+            DefaultTokenSourceProvider::new_with_credentials(config, Box::new(creds))
+                .await
+                .map_err(|e| {
+                    Error::new(ErrorKind::Unexpected, "Failed to initialize GCP token provider")
+                        .with_source(e)
+                })?;
 
-        Ok(token.as_str().to_string())
+        // token_source.token() returns "Bearer <access_token>"
+        // Strip the prefix since authenticate() adds "Bearer " again.
+        let token = provider.token_source().token().await.map_err(|e| {
+            Error::new(
+                ErrorKind::Unexpected,
+                format!("Failed to get GCP access token: {e}"),
+            )
+        })?;
+        Ok(token.strip_prefix("Bearer ").unwrap_or(&token).to_string())
     }
 
     /// Invalidate the current token without generating a new one. On the next request, the client
