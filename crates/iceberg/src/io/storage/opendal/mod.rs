@@ -39,7 +39,7 @@ use opendal::services::GcsConfig;
 use opendal::services::OssConfig;
 #[cfg(feature = "storage-s3")]
 use opendal::services::S3Config;
-use opendal::{Operator, Scheme};
+use opendal::Operator;
 #[cfg(feature = "storage-s3")]
 pub use s3::CustomAwsCredentialLoader;
 use serde::{Deserialize, Serialize};
@@ -241,11 +241,11 @@ impl OpenDalStorage {
 
         match scheme {
             #[cfg(feature = "storage-memory")]
-            Scheme::Memory => Ok(Self::Memory(memory_config_build()?)),
+            "memory" => Ok(Self::Memory(memory_config_build()?)),
             #[cfg(feature = "storage-fs")]
-            Scheme::Fs => Ok(Self::LocalFs),
+            "fs" => Ok(Self::LocalFs),
             #[cfg(feature = "storage-s3")]
-            Scheme::S3 => Ok(Self::S3 {
+            "s3" => Ok(Self::S3 {
                 configured_scheme: scheme_str,
                 config: s3_config_parse(props)?.into(),
                 customized_credential_load: extensions
@@ -253,19 +253,19 @@ impl OpenDalStorage {
                     .map(Arc::unwrap_or_clone),
             }),
             #[cfg(feature = "storage-gcs")]
-            Scheme::Gcs => Ok(Self::Gcs {
+            "gcs" => Ok(Self::Gcs {
                 config: gcs_config_parse(props)?.into(),
             }),
             #[cfg(feature = "storage-azblob")]
-            Scheme::Azblob => Ok(Self::Azblob {
+            "azblob" => Ok(Self::Azblob {
                 config: crate::io::azblob_config_parse(props)?.into(),
             }),
             #[cfg(feature = "storage-oss")]
-            Scheme::Oss => Ok(Self::Oss {
+            "oss" => Ok(Self::Oss {
                 config: oss_config_parse(props)?.into(),
             }),
             #[cfg(feature = "storage-azdls")]
-            Scheme::Azdls => {
+            "azdls" => {
                 let scheme = scheme_str.parse::<AzureStorageScheme>()?;
                 Ok(Self::Azdls {
                     config: azdls_config_parse(props)?.into(),
@@ -438,16 +438,17 @@ impl OpenDalStorage {
         Ok((operator, relative_path))
     }
 
-    /// Parse scheme.
-    fn parse_scheme(scheme: &str) -> Result<Scheme> {
+    /// Parse scheme string to a canonical scheme name.
+    fn parse_scheme(scheme: &str) -> Result<&str> {
         match scheme {
-            "memory" => Ok(Scheme::Memory),
-            "file" | "" => Ok(Scheme::Fs),
-            "s3" | "s3a" => Ok(Scheme::S3),
-            "gs" | "gcs" => Ok(Scheme::Gcs),
-            "oss" => Ok(Scheme::Oss),
-            "abfss" | "abfs" | "wasbs" | "wasb" => Ok(Scheme::Azdls),
-            s => Ok(s.parse::<Scheme>()?),
+            "memory" => Ok("memory"),
+            "file" | "" => Ok("fs"),
+            "s3" | "s3a" => Ok("s3"),
+            "gs" | "gcs" => Ok("gcs"),
+            "oss" => Ok("oss"),
+            "abfss" | "abfs" | "wasbs" | "wasb" => Ok("azdls"),
+            "azblob" => Ok("azblob"),
+            s => Ok(s),
         }
     }
 }
@@ -521,9 +522,13 @@ impl Storage for OpenDalStorage {
         let path = if relative_path.ends_with('/') {
             relative_path.to_string()
         } else {
+            match op.stat(&relative_path).await {
+                Ok(meta) if meta.is_file() => return Ok(()),
+                _ => {}
+            }
             format!("{relative_path}/")
         };
-        Ok(op.remove_all(&path).await?)
+        Ok(op.delete_with(&path).recursive(true).await?)
     }
 
     #[allow(unreachable_code, unused_variables)]

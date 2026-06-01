@@ -147,9 +147,15 @@ impl FileIO {
         let path = if relative_path.ends_with('/') {
             relative_path.to_string()
         } else {
+            // Check if the path without trailing slash is a file.
+            // If so, this is a no-op per the documented contract.
+            match op.stat(&relative_path).await {
+                Ok(meta) if meta.is_file() => return Ok(()),
+                _ => {}
+            }
             format!("{relative_path}/")
         };
-        Ok(op.remove_all(&path).await?)
+        Ok(op.delete_with(&path).recursive(true).await?)
     }
 
     /// Check file exists.

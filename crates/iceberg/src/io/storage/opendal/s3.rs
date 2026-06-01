@@ -18,11 +18,10 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use async_trait::async_trait;
 use opendal::services::S3Config;
 use opendal::{Configurator, Operator};
-pub use reqsign::{AwsCredential, AwsCredentialLoad};
-use reqwest::Client;
+pub use reqsign_aws_v4::Credential as AwsCredential;
+use reqsign_core::{Context, ProvideCredentialChain};
 use url::Url;
 
 use crate::io::{
@@ -100,7 +99,7 @@ pub(crate) fn s3_config_parse(mut m: HashMap<String, String>) -> Result<S3Config
     if let Some(allow_anonymous) = m.remove(S3_ALLOW_ANONYMOUS)
         && is_truthy(allow_anonymous.to_lowercase().as_str())
     {
-        cfg.allow_anonymous = true;
+        cfg.skip_signature = true;
     }
     if let Some(disable_ec2_metadata) = m.remove(S3_DISABLE_EC2_METADATA)
         && is_truthy(disable_ec2_metadata.to_lowercase().as_str())
@@ -137,8 +136,9 @@ pub(crate) fn s3_config_build(
         .bucket(bucket);
 
     if let Some(customized_credential_load) = customized_credential_load {
-        builder = builder
-            .customized_credential_load(customized_credential_load.clone().into_opendal_loader());
+        let chain =
+            ProvideCredentialChain::new().push(customized_credential_load.clone());
+        builder = builder.credential_provider_chain(chain);
     }
 
     Ok(Operator::new(builder)?.finish())
@@ -149,7 +149,7 @@ pub(crate) fn s3_config_build(
 ///
 /// This should be set as an extension on `FileIOBuilder`.
 #[derive(Clone)]
-pub struct CustomAwsCredentialLoader(Arc<dyn AwsCredentialLoad>);
+pub struct CustomAwsCredentialLoader(Arc<dyn AwsCredentialLoadDyn>);
 
 impl std::fmt::Debug for CustomAwsCredentialLoader {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -160,19 +160,36 @@ impl std::fmt::Debug for CustomAwsCredentialLoader {
 
 impl CustomAwsCredentialLoader {
     /// Create a new custom AWS credential loader.
-    pub fn new(loader: Arc<dyn AwsCredentialLoad>) -> Self {
+    pub fn new(loader: Arc<dyn AwsCredentialLoadDyn>) -> Self {
         Self(loader)
-    }
-
-    /// Convert this loader into an opendal compatible loader for customized AWS credentials.
-    pub fn into_opendal_loader(self) -> Box<dyn AwsCredentialLoad> {
-        Box::new(self)
     }
 }
 
-#[async_trait]
-impl AwsCredentialLoad for CustomAwsCredentialLoader {
-    async fn load_credential(&self, client: Client) -> anyhow::Result<Option<AwsCredential>> {
-        self.0.load_credential(client).await
+/// Trait for dynamically providing AWS credentials.
+///
+/// This is the dyn-safe version of `ProvideCredential<Credential = AwsCredential>`.
+/// Implement this trait to provide custom AWS credential sources.
+pub trait AwsCredentialLoadDyn: Send + Sync + std::fmt::Debug + std::marker::Unpin + 'static {
+    /// Load credential from the custom source.
+    fn provide_credential_dyn(
+        &self,
+        ctx: &Context,
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<Output = reqsign_core::Result<Option<AwsCredential>>>
+                + Send
+                + '_,
+        >,
+    >;
+}
+
+impl reqsign_core::ProvideCredential for CustomAwsCredentialLoader {
+    type Credential = AwsCredential;
+
+    fn provide_credential(
+        &self,
+        ctx: &Context,
+    ) -> impl std::future::Future<Output = reqsign_core::Result<Option<AwsCredential>>> + Send {
+        self.0.provide_credential_dyn(ctx)
     }
 }
