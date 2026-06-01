@@ -522,6 +522,10 @@ impl Storage for OpenDalStorage {
         let path = if relative_path.ends_with('/') {
             relative_path.to_string()
         } else {
+            match op.stat(&relative_path).await {
+                Ok(meta) if meta.is_file() => return Ok(()),
+                _ => {}
+            }
             format!("{relative_path}/")
         };
         Ok(op.delete_with(&path).recursive(true).await?)

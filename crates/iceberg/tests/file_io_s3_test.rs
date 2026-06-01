@@ -23,15 +23,13 @@
 mod tests {
     use std::sync::Arc;
 
-    use async_trait::async_trait;
     use futures::TryStreamExt;
     use iceberg::io::{
-        CustomAwsCredentialLoader, FileIO, FileIOBuilder, S3_ACCESS_KEY_ID, S3_ENDPOINT, S3_REGION,
-        S3_SECRET_ACCESS_KEY,
+        AwsCredential, AwsCredentialLoadDyn, CustomAwsCredentialLoader, FileIO, FileIOBuilder,
+        S3_ACCESS_KEY_ID, S3_ENDPOINT, S3_REGION, S3_SECRET_ACCESS_KEY,
     };
     use iceberg_test_utils::{get_minio_endpoint, normalize_test_name_with_parts, set_up};
-    use reqsign::{AwsCredential, AwsCredentialLoad};
-    use reqwest::Client;
+    use reqsign_core::Context;
 
     async fn get_file_io() -> FileIO {
         set_up();
@@ -96,6 +94,7 @@ mod tests {
     }
 
     // Mock credential loader for testing
+    #[derive(Debug)]
     struct MockCredentialLoader {
         credential: Option<AwsCredential>,
     }
@@ -115,10 +114,19 @@ mod tests {
         }
     }
 
-    #[async_trait]
-    impl AwsCredentialLoad for MockCredentialLoader {
-        async fn load_credential(&self, _client: Client) -> anyhow::Result<Option<AwsCredential>> {
-            Ok(self.credential.clone())
+    impl AwsCredentialLoadDyn for MockCredentialLoader {
+        fn provide_credential_dyn(
+            &self,
+            _ctx: &Context,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = reqsign_core::Result<Option<AwsCredential>>>
+                    + Send
+                    + '_,
+            >,
+        > {
+            let cred = self.credential.clone();
+            Box::pin(async move { Ok(cred) })
         }
     }
 
