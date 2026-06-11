@@ -28,8 +28,7 @@ use super::{
 };
 use crate::error::Result;
 use crate::spec::{
-    DataContentType, DataFile, ManifestContentType, ManifestEntry, ManifestFile, ManifestStatus,
-    Operation,
+    DataContentType, DataFile, ManifestEntry, ManifestFile, ManifestStatus, Operation,
 };
 use crate::table::Table;
 use crate::transaction::snapshot::SnapshotProduceOperation;
@@ -211,11 +210,19 @@ impl SnapshotProduceOperation for OverwriteFilesOperation {
             let mut deleted_entries = Vec::new();
 
             for manifest_file in manifest_list.entries() {
+                if !snapshot_produce.can_contain_removed_files(manifest_file.content) {
+                    continue;
+                }
+
                 let manifest = manifest_file
                     .load_manifest(snapshot_produce.table.file_io())
                     .await?;
 
                 for entry in manifest.entries() {
+                    if !entry.is_alive() {
+                        continue;
+                    }
+
                     if entry.content_type() == DataContentType::Data
                         && snapshot_produce
                             .removed_data_file_paths
@@ -224,11 +231,11 @@ impl SnapshotProduceOperation for OverwriteFilesOperation {
                         deleted_entries.push(gen_manifest_entry(entry));
                     }
 
-                    if entry.content_type() == DataContentType::PositionDeletes
-                        || entry.content_type() == DataContentType::EqualityDeletes
-                            && snapshot_produce
-                                .removed_delete_file_paths
-                                .contains(entry.data_file().file_path())
+                    if (entry.content_type() == DataContentType::PositionDeletes
+                        || entry.content_type() == DataContentType::EqualityDeletes)
+                        && snapshot_produce
+                            .removed_delete_file_paths
+                            .contains(entry.data_file().file_path())
                     {
                         deleted_entries.push(gen_manifest_entry(entry));
                     }
@@ -263,12 +270,20 @@ impl SnapshotProduceOperation for OverwriteFilesOperation {
         let mut existing_files = Vec::new();
 
         for manifest_file in manifest_list.entries() {
+            if !snapshot_produce.can_contain_removed_files(manifest_file.content) {
+                existing_files.push(manifest_file.clone());
+                continue;
+            }
+
             let manifest = manifest_file.load_manifest(file_io_ref).await?;
 
             let found_deleted_files: HashSet<_> = manifest
                 .entries()
                 .iter()
                 .filter_map(|entry| {
+                    if !entry.is_alive() {
+                        return None;
+                    }
                     if snapshot_produce
                         .removed_data_file_paths
                         .contains(entry.data_file().file_path())
@@ -286,20 +301,20 @@ impl SnapshotProduceOperation for OverwriteFilesOperation {
             if found_deleted_files.is_empty() {
                 existing_files.push(manifest_file.clone());
             } else {
-                // Rewrite the manifest file without the deleted data files
-                if manifest
-                    .entries()
-                    .iter()
-                    .any(|entry| !found_deleted_files.contains(entry.data_file().file_path()))
-                {
+                // Rewrite the manifest file without the deleted files
+                if manifest.entries().iter().any(|entry| {
+                    entry.is_alive() && !found_deleted_files.contains(entry.data_file().file_path())
+                }) {
                     let mut manifest_writer = snapshot_produce.new_manifest_writer(
-                        ManifestContentType::Data,
+                        manifest_file.content,
                         manifest_file.partition_spec_id,
                     )?;
 
                     for entry in manifest.entries() {
-                        if !found_deleted_files.contains(entry.data_file().file_path()) {
-                            manifest_writer.add_entry((**entry).clone())?;
+                        if entry.is_alive()
+                            && !found_deleted_files.contains(entry.data_file().file_path())
+                        {
+                            manifest_writer.add_existing_entry((**entry).clone())?;
                         }
                     }
 

@@ -17,24 +17,28 @@
 
 //! Remove dangling delete files action.
 //!
-//! Removes position delete file entries from manifests when their referenced
-//! data file no longer exists in the current snapshot. This reduces metadata
-//! overhead and storage consumption for tables with high CDC throughput.
+//! Removes position delete files, deletion vectors, and equality delete files
+//! from manifests when they no longer apply to any live data file in the
+//! current snapshot. This reduces metadata overhead and storage consumption
+//! for tables with high CDC throughput.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use crate::spec::{DataContentType, DataFile, MAIN_BRANCH};
-use crate::transaction::ApplyTransactionAction;
-use crate::transaction::Transaction;
+use crate::spec::{DataContentType, DataFile, MAIN_BRANCH, Struct};
+use crate::transaction::{ApplyTransactionAction, Transaction};
+use crate::utils::{DEFAULT_LOAD_CONCURRENCY_LIMIT, load_manifests};
 use crate::{Catalog, Error, ErrorKind, Result, TableIdent};
 
-/// Action to remove dangling position delete files from a table.
+/// Action to remove dangling delete files from a table.
 ///
-/// A position delete file becomes "dangling" when the data file it references
-/// (via `referenced_data_file`) has been removed by compaction or partition
-/// expiration. These orphaned delete entries still consume metadata space and
-/// increase query planning cost.
+/// Three categories of dangling deletes are handled:
+///
+/// - **Position deletes / deletion vectors**: removed when their
+///   `referenced_data_file` no longer exists in the current snapshot.
+/// - **Equality deletes**: removed when their sequence number is ≤ the
+///   minimum data file sequence number in their partition (Iceberg V2 spec:
+///   an equality delete at seq S only applies to data files with seq < S).
 ///
 /// # Example
 ///
@@ -79,41 +83,104 @@ impl RemoveDanglingDeleteFilesAction {
             .await?;
 
         let mut data_file_paths: HashSet<String> = HashSet::new();
-        let mut dangling: Vec<DataFile> = Vec::new();
+        let mut pos_deletes: Vec<(DataFile, Option<i64>)> = Vec::new();
+        let mut eq_deletes: Vec<(DataFile, i64)> = Vec::new();
+        let mut partition_min_seq: HashMap<(i32, Struct), i64> = HashMap::new();
+        let mut global_min_data_seq: Option<i64> = None;
 
-        for mf in manifest_list.entries() {
-            let manifest = mf.load_manifest(table.file_io()).await?;
+        let manifest_files: Vec<_> = manifest_list.entries().to_vec();
+        let loaded = load_manifests(
+            table.file_io(),
+            manifest_files,
+            DEFAULT_LOAD_CONCURRENCY_LIMIT,
+        )
+        .await?;
+
+        for (_, manifest) in loaded {
             let (entries, _) = manifest.into_parts();
 
             for entry in entries {
+                if !entry.is_alive() {
+                    continue;
+                }
+
+                let df = entry.data_file();
+                let seq = entry.sequence_number();
+
                 match entry.content_type() {
                     DataContentType::Data => {
-                        data_file_paths.insert(entry.data_file().file_path().to_string());
-                    }
-                    DataContentType::PositionDeletes => {
-                        let df = entry.data_file();
-                        if df.referenced_data_file().is_some() {
-                            dangling.push(df.clone());
+                        data_file_paths.insert(df.file_path().to_string());
+                        if let Some(s) = seq {
+                            let key = (df.partition_spec_id(), df.partition().clone());
+                            partition_min_seq
+                                .entry(key)
+                                .and_modify(|min| *min = (*min).min(s))
+                                .or_insert(s);
+                            global_min_data_seq = Some(global_min_data_seq.map_or(s, |g| g.min(s)));
                         }
                     }
-                    _ => {}
+                    DataContentType::PositionDeletes => {
+                        pos_deletes.push((df.clone(), seq));
+                    }
+                    DataContentType::EqualityDeletes => {
+                        if let Some(s) = seq {
+                            eq_deletes.push((df.clone(), s));
+                        }
+                    }
                 }
             }
         }
 
-        dangling.retain(|df| {
-            df.referenced_data_file()
-                .map_or(false, |p| !data_file_paths.contains(&p))
-        });
+        let mut dangling: Vec<DataFile> = Vec::new();
+
+        dangling.extend(
+            pos_deletes
+                .into_iter()
+                .filter(|(df, df_seq)| {
+                    if let Some(ref_path) = df.referenced_data_file() {
+                        // Path-based: dangling if the referenced data file no longer exists
+                        !data_file_paths.contains(&ref_path)
+                    } else if let Some(s) = df_seq {
+                        // Sequence-based: dangling if seq < min_data_seq in this partition
+                        let key = (df.partition_spec_id(), df.partition().clone());
+                        partition_min_seq
+                            .get(&key)
+                            .map_or(true, |&min_seq| *s < min_seq)
+                    } else {
+                        // No referenced_data_file and no sequence number — cannot determine
+                        false
+                    }
+                })
+                .map(|(df, _)| df),
+        );
+
+        dangling.extend(
+            eq_deletes
+                .into_iter()
+                .filter(|(df, seq)| {
+                    if df.partition().fields().is_empty() {
+                        // Unpartitioned equality deletes are global — they apply to all
+                        // data files regardless of partition. Only remove if seq is <=
+                        // the global minimum data sequence number.
+                        global_min_data_seq.map_or(true, |g| *seq <= g)
+                    } else {
+                        let key = (df.partition_spec_id(), df.partition().clone());
+                        partition_min_seq
+                            .get(&key)
+                            .map_or(true, |&min_seq| *seq <= min_seq)
+                    }
+                })
+                .map(|(df, _)| df),
+        );
+
+        let mut seen: HashSet<String> = HashSet::new();
+        dangling.retain(|df| seen.insert(df.file_path().to_string()));
 
         if dangling.is_empty() {
             return Ok(0);
         }
 
         let dangling_count = dangling.len();
-
-        // Build a rewrite-files transaction that removes the dangling delete
-        // entries from the manifest without adding any new data.
         let txn = Transaction::new(&table);
         let branch = self.to_branch.clone();
         let action = txn
@@ -121,9 +188,12 @@ impl RemoveDanglingDeleteFilesAction {
             .delete_files(dangling)
             .set_target_branch(branch);
 
-        let txn = action
-            .apply(txn)
-            .map_err(|e| Error::new(ErrorKind::Unexpected, format!("Failed to build rewrite action: {e}")))?;
+        let txn = action.apply(txn).map_err(|e| {
+            Error::new(
+                ErrorKind::Unexpected,
+                format!("Failed to build rewrite action: {e}"),
+            )
+        })?;
 
         txn.commit(self.catalog.as_ref()).await?;
 
@@ -136,18 +206,16 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Arc;
 
-    use crate::catalog::memory::{MemoryCatalogBuilder, MEMORY_CATALOG_WAREHOUSE};
+    use super::RemoveDanglingDeleteFilesAction;
+    use crate::catalog::memory::{MEMORY_CATALOG_WAREHOUSE, MemoryCatalogBuilder};
     use crate::catalog::{Catalog, CatalogBuilder};
     use crate::spec::{
-        DataContentType, DataFileBuilder, DataFileFormat, NestedField, PrimitiveType, Schema,
-        Type, MAIN_BRANCH,
+        DataContentType, DataFileBuilder, DataFileFormat, MAIN_BRANCH, NestedField, PrimitiveType,
+        Schema, Type,
     };
     use crate::table::Table;
-    use crate::transaction::ApplyTransactionAction;
-    use crate::transaction::Transaction;
+    use crate::transaction::{ApplyTransactionAction, Transaction};
     use crate::{NamespaceIdent, TableCreation, TableIdent};
-
-    use super::RemoveDanglingDeleteFilesAction;
 
     fn simple_schema() -> Schema {
         Schema::builder()
@@ -174,17 +242,16 @@ mod tests {
             .schema(simple_schema())
             .build();
 
-        catalog.create_table(&table_ident.namespace, table_creation).await.unwrap();
+        catalog
+            .create_table(&table_ident.namespace, table_creation)
+            .await
+            .unwrap();
 
         let table = catalog.load_table(&table_ident).await.unwrap();
         (table_ident, table)
     }
 
-    async fn commit_data_file(
-        catalog: &Arc<dyn Catalog>,
-        table: &Table,
-        file_path: &str,
-    ) -> Table {
+    async fn commit_data_file(catalog: &Arc<dyn Catalog>, table: &Table, file_path: &str) -> Table {
         let data_file = DataFileBuilder::default()
             .content(DataContentType::Data)
             .file_path(file_path.to_string())
@@ -277,5 +344,240 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(removed, 0);
+    }
+
+    #[tokio::test]
+    async fn test_remove_dangling_equality_delete() {
+        let catalog = build_catalog().await;
+        let (table_ident, table) = create_test_table(&catalog, "test_eq_dangling").await;
+
+        // Commit equality delete first → gets lower sequence number
+        let eq_delete = DataFileBuilder::default()
+            .content(DataContentType::EqualityDeletes)
+            .file_path("memory://test/eq-del-1.parquet".to_string())
+            .file_format(DataFileFormat::Parquet)
+            .record_count(1)
+            .file_size_in_bytes(100)
+            .equality_ids(Some(vec![1]))
+            .build()
+            .unwrap();
+
+        let txn = Transaction::new(&table);
+        let action = txn
+            .rewrite_files()
+            .add_data_files(vec![eq_delete])
+            .set_target_branch(MAIN_BRANCH.to_string());
+        let txn = action.apply(txn).unwrap();
+        let table = txn.commit(catalog.as_ref()).await.unwrap();
+
+        // Commit data file second → gets higher sequence number.
+        // The equality delete at lower seq applies to files with seq < its seq.
+        // All data files have higher seq, so the equality delete is dangling.
+        let _table = commit_data_file(&catalog, &table, "memory://test/data-1.parquet").await;
+
+        let removed = RemoveDanglingDeleteFilesAction::new(catalog.clone(), table_ident)
+            .execute()
+            .await
+            .unwrap();
+        assert_eq!(removed, 1);
+    }
+
+    #[tokio::test]
+    async fn test_keep_equality_delete_when_data_has_lower_seq() {
+        let catalog = build_catalog().await;
+        let (table_ident, table) = create_test_table(&catalog, "test_eq_kept").await;
+
+        // Commit data file first → gets lower sequence number
+        let table = commit_data_file(&catalog, &table, "memory://test/data-1.parquet").await;
+
+        // Commit equality delete second → gets higher sequence number.
+        // The equality delete at higher seq applies to the data file at lower seq.
+        let eq_delete = DataFileBuilder::default()
+            .content(DataContentType::EqualityDeletes)
+            .file_path("memory://test/eq-del-1.parquet".to_string())
+            .file_format(DataFileFormat::Parquet)
+            .record_count(1)
+            .file_size_in_bytes(100)
+            .equality_ids(Some(vec![1]))
+            .build()
+            .unwrap();
+
+        let txn = Transaction::new(&table);
+        let action = txn
+            .rewrite_files()
+            .add_data_files(vec![eq_delete])
+            .set_target_branch(MAIN_BRANCH.to_string());
+        let txn = action.apply(txn).unwrap();
+        txn.commit(catalog.as_ref()).await.unwrap();
+
+        let removed = RemoveDanglingDeleteFilesAction::new(catalog.clone(), table_ident)
+            .execute()
+            .await
+            .unwrap();
+        assert_eq!(removed, 0);
+    }
+
+    #[tokio::test]
+    async fn test_position_delete_without_ref_removed_by_seq() {
+        let catalog = build_catalog().await;
+        let (table_ident, table) = create_test_table(&catalog, "test_pos_seq").await;
+
+        let pos_delete = DataFileBuilder::default()
+            .content(DataContentType::PositionDeletes)
+            .file_path("memory://test/pos-del-1.parquet".to_string())
+            .file_format(DataFileFormat::Parquet)
+            .record_count(1)
+            .file_size_in_bytes(100)
+            .build()
+            .unwrap();
+
+        let txn = Transaction::new(&table);
+        let action = txn
+            .rewrite_files()
+            .add_data_files(vec![pos_delete])
+            .set_target_branch(MAIN_BRANCH.to_string());
+        let txn = action.apply(txn).unwrap();
+        let table = txn.commit(catalog.as_ref()).await.unwrap();
+
+        let _ = commit_data_file(&catalog, &table, "memory://test/data-1.parquet").await;
+
+        let removed = RemoveDanglingDeleteFilesAction::new(catalog.clone(), table_ident)
+            .execute()
+            .await
+            .unwrap();
+        assert_eq!(removed, 1);
+    }
+
+    #[tokio::test]
+    async fn test_position_delete_without_ref_kept_by_seq() {
+        let catalog = build_catalog().await;
+        let (table_ident, table) = create_test_table(&catalog, "test_pos_seq_kept").await;
+
+        let table = commit_data_file(&catalog, &table, "memory://test/data-1.parquet").await;
+
+        let pos_delete = DataFileBuilder::default()
+            .content(DataContentType::PositionDeletes)
+            .file_path("memory://test/pos-del-1.parquet".to_string())
+            .file_format(DataFileFormat::Parquet)
+            .record_count(1)
+            .file_size_in_bytes(100)
+            .build()
+            .unwrap();
+
+        let txn = Transaction::new(&table);
+        let action = txn
+            .rewrite_files()
+            .add_data_files(vec![pos_delete])
+            .set_target_branch(MAIN_BRANCH.to_string());
+        let txn = action.apply(txn).unwrap();
+        txn.commit(catalog.as_ref()).await.unwrap();
+
+        let removed = RemoveDanglingDeleteFilesAction::new(catalog.clone(), table_ident)
+            .execute()
+            .await
+            .unwrap();
+        assert_eq!(removed, 0);
+    }
+
+    #[tokio::test]
+    async fn test_remove_global_equality_delete() {
+        let catalog = build_catalog().await;
+        let (table_ident, table) = create_test_table(&catalog, "test_global_eq").await;
+
+        let eq_delete = DataFileBuilder::default()
+            .content(DataContentType::EqualityDeletes)
+            .file_path("memory://test/eq-del-1.parquet".to_string())
+            .file_format(DataFileFormat::Parquet)
+            .record_count(1)
+            .file_size_in_bytes(100)
+            .equality_ids(Some(vec![1]))
+            .build()
+            .unwrap();
+
+        let txn = Transaction::new(&table);
+        let action = txn
+            .rewrite_files()
+            .add_data_files(vec![eq_delete])
+            .set_target_branch(MAIN_BRANCH.to_string());
+        let txn = action.apply(txn).unwrap();
+        let table = txn.commit(catalog.as_ref()).await.unwrap();
+
+        let _ = commit_data_file(&catalog, &table, "memory://test/data-1.parquet").await;
+
+        let removed = RemoveDanglingDeleteFilesAction::new(catalog.clone(), table_ident)
+            .execute()
+            .await
+            .unwrap();
+        assert_eq!(removed, 1);
+    }
+
+    #[tokio::test]
+    async fn test_partial_delete_manifest_removes_dangling_only() {
+        let catalog = build_catalog().await;
+        let (table_ident, table) = create_test_table(&catalog, "test_partial").await;
+
+        let data_file_path = "memory://test/data-1.parquet";
+        let table = commit_data_file(&catalog, &table, data_file_path).await;
+
+        let dangling = DataFileBuilder::default()
+            .content(DataContentType::PositionDeletes)
+            .file_path("memory://test/dangling.parquet".to_string())
+            .file_format(DataFileFormat::Parquet)
+            .record_count(1)
+            .file_size_in_bytes(100)
+            .referenced_data_file(Some("memory://test/nonexistent.parquet".to_string()))
+            .build()
+            .unwrap();
+
+        let kept = DataFileBuilder::default()
+            .content(DataContentType::PositionDeletes)
+            .file_path("memory://test/kept.parquet".to_string())
+            .file_format(DataFileFormat::Parquet)
+            .record_count(1)
+            .file_size_in_bytes(100)
+            .referenced_data_file(Some(data_file_path.to_string()))
+            .build()
+            .unwrap();
+
+        let txn = Transaction::new(&table);
+        let action = txn
+            .rewrite_files()
+            .add_data_files(vec![dangling, kept])
+            .set_target_branch(MAIN_BRANCH.to_string());
+        let txn = action.apply(txn).unwrap();
+        txn.commit(catalog.as_ref()).await.unwrap();
+
+        let removed = RemoveDanglingDeleteFilesAction::new(catalog.clone(), table_ident.clone())
+            .execute()
+            .await
+            .unwrap();
+        assert_eq!(removed, 1);
+
+        let table = catalog.load_table(&table_ident).await.unwrap();
+        let snapshot = table.metadata().current_snapshot().unwrap();
+        let manifest_list = snapshot
+            .load_manifest_list(table.file_io(), table.metadata())
+            .await
+            .unwrap();
+
+        let mut found_kept = false;
+        let mut found_dangling = false;
+        for mf in manifest_list.entries() {
+            let manifest = mf.load_manifest(table.file_io()).await.unwrap();
+            for entry in manifest.entries() {
+                if !entry.is_alive() {
+                    continue;
+                }
+                let path = entry.data_file().file_path();
+                if path == "memory://test/kept.parquet" {
+                    found_kept = true;
+                }
+                if path == "memory://test/dangling.parquet" {
+                    found_dangling = true;
+                }
+            }
+        }
+        assert!(found_kept, "kept delete should still be live");
+        assert!(!found_dangling, "dangling delete should be removed");
     }
 }
