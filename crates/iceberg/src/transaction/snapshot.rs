@@ -1055,7 +1055,18 @@ impl ManifestProcess for MergeManifestProcess {
                 .await?
         };
 
-        data_manifest.extend(unmerge_delete_manifest);
+        let delete_manifest = {
+            let manifest_merge_manager = MergeManifestManager::new(
+                self.target_size_bytes,
+                self.min_count_to_merge,
+                ManifestContentType::Deletes,
+            );
+            manifest_merge_manager
+                .merge_manifest(snapshot_produce, unmerge_delete_manifest)
+                .await?
+        };
+
+        data_manifest.extend(delete_manifest);
         Ok(data_manifest)
     }
 }
@@ -1135,6 +1146,7 @@ impl MergeManifestManager {
         snapshot_produce: &mut SnapshotProducer<'_>,
         first_manifest: &ManifestFile,
         group_manifests: Vec<ManifestFile>,
+        spec_id: i32,
     ) -> Result<Vec<ManifestFile>> {
         let packer: ListPacker<ManifestFile> = ListPacker::new(self.target_size_bytes);
         let manifest_bins =
@@ -1162,7 +1174,7 @@ impl MergeManifestManager {
                             Box<dyn Future<Output = Result<Vec<ManifestFile>>> + Send>,
                         >)
                 } else {
-                    let writer = snapshot_produce.new_manifest_writer(self.content, snapshot_produce.table.metadata().default_partition_spec_id())?;
+                    let writer = snapshot_produce.new_manifest_writer(self.content, spec_id)?;
                     let snapshot_id = snapshot_produce.snapshot_id;
                     let file_io = snapshot_produce.table.file_io().clone();
                     Ok((Box::pin(async move {
@@ -1204,9 +1216,9 @@ impl MergeManifestManager {
         let group_manifests = self.group_by_spec(manifests);
 
         let mut merge_manifests = vec![];
-        for (_spec_id, manifests) in group_manifests.into_iter().rev() {
+        for (spec_id, manifests) in group_manifests.into_iter().rev() {
             merge_manifests.extend(
-                self.merge_group(snapshot_produce, &first_manifest, manifests)
+                self.merge_group(snapshot_produce, &first_manifest, manifests, spec_id)
                     .await?,
             );
         }
