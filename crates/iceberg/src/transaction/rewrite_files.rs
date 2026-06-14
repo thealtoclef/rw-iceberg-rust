@@ -210,7 +210,7 @@ impl SnapshotProduceOperation for RewriteFilesOperation {
             let mut deleted_entries = Vec::new();
 
             for manifest_file in manifest_list.entries() {
-                if !snapshot_produce.can_contain_removed_files(manifest_file.content) {
+                if !snapshot_produce.has_removed_files_for_manifest_type(manifest_file.content) {
                     continue;
                 }
 
@@ -270,7 +270,7 @@ impl SnapshotProduceOperation for RewriteFilesOperation {
         let mut existing_files = Vec::new();
 
         for manifest_file in manifest_list.entries() {
-            if !snapshot_produce.can_contain_removed_files(manifest_file.content) {
+            if !snapshot_produce.has_removed_files_for_manifest_type(manifest_file.content) {
                 existing_files.push(manifest_file.clone());
                 continue;
             }
