@@ -29,7 +29,6 @@ use futures::stream::{self, StreamExt};
 
 use crate::Result;
 use crate::table::Table;
-use crate::utils::{load_manifest_lists, load_manifests};
 
 /// Default time offset for orphan file deletion threshold (1 day in milliseconds).
 const DEFAULT_OLDER_THAN_MS: i64 = 7 * 24 * 60 * 60 * 1000; // 7 days
@@ -142,11 +141,11 @@ impl RemoveOrphanFilesAction {
         }
 
         // Remove orphan files concurrently.
-        // Clone paths into owned Strings so each async task owns its data,
+        // Clone each path into an owned String so the async task owns its data,
         // making the resulting future Send-safe (avoids HRTB lifetime issues
         // with borrowed references across await points).
         let file_io = file_io.clone();
-        stream::iter(orphan_files.clone())
+        stream::iter(orphan_files.iter().cloned())
             .map(|path| {
                 let file_io = file_io.clone();
                 async move { file_io.delete(&path).await }
@@ -210,36 +209,49 @@ impl RemoveOrphanFilesAction {
 
         let snapshots: Vec<_> = table_metadata.snapshots().cloned().collect();
 
-        // Load manifest lists concurrently using shared loader
-        let loaded_lists =
-            load_manifest_lists(file_io, &table_metadata, snapshots, self.load_concurrency).await?;
-
-        // Collect manifest list paths, manifest files, and deduplicate for loading
+        // Record reachable manifest list paths and collect the unique set of manifests.
         let mut unique_manifest_files = Vec::new();
-        for (snapshot, manifest_list) in loaded_lists {
-            // Record manifest list path as reachable
-            let manifest_list_path = snapshot.manifest_list();
-            if !manifest_list_path.is_empty() {
-                reachable.insert(manifest_list_path.to_string());
-            }
-
-            for manifest_file in manifest_list.entries() {
-                // Only load each manifest once (reachable set handles deduplication)
-                if reachable.insert(manifest_file.manifest_path.clone()) {
-                    unique_manifest_files.push(manifest_file.clone());
+        stream::iter(snapshots)
+            .map(|snapshot| {
+                let file_io = file_io.clone();
+                let table_metadata = table_metadata.clone();
+                async move {
+                    let manifest_list = snapshot
+                        .load_manifest_list(&file_io, &table_metadata)
+                        .await?;
+                    Ok((snapshot, manifest_list))
                 }
-            }
-        }
+            })
+            .buffer_unordered(self.load_concurrency)
+            .try_for_each(|(snapshot, manifest_list)| {
+                let manifest_list_path = snapshot.manifest_list();
+                if !manifest_list_path.is_empty() {
+                    reachable.insert(manifest_list_path.to_string());
+                }
+                for manifest_file in manifest_list.entries() {
+                    // Only load each manifest once (reachable set handles deduplication)
+                    if reachable.insert(manifest_file.manifest_path.clone()) {
+                        unique_manifest_files.push(manifest_file.clone());
+                    }
+                }
+                std::future::ready(Ok::<(), crate::Error>(()))
+            })
+            .await?;
 
-        // Load manifests concurrently using shared loader and collect content files
-        let loaded_manifests =
-            load_manifests(file_io, unique_manifest_files, self.load_concurrency).await?;
-
-        for (_, manifest) in loaded_manifests {
-            for entry in manifest.entries() {
-                reachable.insert(entry.data_file().file_path().to_string());
-            }
-        }
+        // Collect the data file paths referenced by each manifest.
+        stream::iter(unique_manifest_files)
+            .map(|manifest_file| {
+                let file_io = file_io.clone();
+                async move { manifest_file.load_manifest(&file_io).await }
+            })
+            .buffer_unordered(self.load_concurrency)
+            .try_for_each(|manifest| {
+                for entry in manifest.entries() {
+                    reachable.insert(entry.data_file().file_path().to_string());
+                }
+                std::future::ready(Ok::<(), crate::Error>(()))
+            })
+            .await?;
 
         Ok(())
     }
