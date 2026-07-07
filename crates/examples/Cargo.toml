@@ -43,6 +43,12 @@ name = "oss-backend"
 path = "src/oss_backend.rs"
 required-features = ["storage-oss"]
 
+[[example]]
+name = "remove-dangling-deletes"
+path = "src/remove_dangling_deletes.rs"
+required-features = ["storage-gcs"]
+
 [features]
 default = []
 storage-oss = ["iceberg/storage-oss"]
+storage-gcs = ["iceberg/storage-gcs"]
