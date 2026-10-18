@@ -17,16 +17,23 @@
 
 use std::sync::Arc;
 
+use arrow_array::cast::AsArray;
+use arrow_array::{
+    Array, ArrayRef, RecordBatch, RecordBatchOptions, StructArray, make_array, new_null_array,
+};
+use arrow_buffer::NullBuffer;
+use arrow_cast::cast::cast;
+use arrow_schema::{ArrowError, DataType, Field, Fields, SchemaRef as ArrowSchemaRef};
 use futures::{StreamExt, TryStreamExt};
-use parquet::arrow::ParquetRecordBatchStreamBuilder;
+use parquet::arrow::{PARQUET_FIELD_ID_META_KEY, ParquetRecordBatchStreamBuilder};
 
-use crate::arrow::ArrowReader;
 use crate::arrow::reader::ParquetReadOptions;
 use crate::arrow::record_batch_transformer::RecordBatchTransformerBuilder;
 use crate::arrow::scan_metrics::ScanMetrics;
+use crate::arrow::{ArrowReader, arrow_schema_to_schema, schema_to_arrow_schema};
 use crate::io::FileIO;
 use crate::scan::{ArrowRecordBatchStream, FileScanTaskDeleteFile};
-use crate::spec::{Schema, SchemaRef};
+use crate::spec::{Schema, SchemaRef, prune_columns};
 use crate::{Error, ErrorKind, Result};
 
 /// Delete File Loader
@@ -97,26 +104,188 @@ impl BasicDeleteFileLoader {
     ///
     /// Per the [Iceberg spec](https://iceberg.apache.org/spec/#equality-delete-files),
     /// only evolves the specified `equality_ids` columns, not all table columns.
+    ///
+    /// An equality id may name a field nested in a struct. Projection resolves top-level
+    /// fields only, so the batches are instead projected onto the target schema pruned to the
+    /// equality ids, resolving every nested field by its field id. With
+    /// `require_source_columns`, every equality id must be stored in the file: a missing key
+    /// column must not be materialized as null or a default.
     pub(crate) async fn evolve_schema(
         record_batch_stream: ArrowRecordBatchStream,
         target_schema: Arc<Schema>,
         equality_ids: &[i32],
         require_source_columns: bool,
     ) -> Result<ArrowRecordBatchStream> {
-        let mut builder = RecordBatchTransformerBuilder::new(target_schema.clone(), equality_ids);
-        if require_source_columns {
-            builder = builder.with_required_source_fields(equality_ids.iter().copied());
-        }
-        let mut record_batch_transformer = builder.build();
+        let has_nested_ids = equality_ids.iter().any(|id| {
+            target_schema.field_by_id(*id).is_some()
+                && target_schema.as_struct().field_by_id(*id).is_none()
+        });
 
+        if !has_nested_ids {
+            let mut builder = RecordBatchTransformerBuilder::new(target_schema, equality_ids);
+            if require_source_columns {
+                builder = builder.with_required_source_fields(equality_ids.iter().copied());
+            }
+            let mut record_batch_transformer = builder.build();
+
+            let record_batch_stream = record_batch_stream.map(move |record_batch| {
+                record_batch_transformer.process_record_batch(record_batch?)
+            });
+            return Ok(Box::pin(record_batch_stream) as ArrowRecordBatchStream);
+        }
+
+        let crate::spec::Type::Struct(pruned) =
+            prune_columns(&target_schema, equality_ids.iter().copied(), false)?
+        else {
+            unreachable!("pruning a schema yields a struct");
+        };
+        let pruned_schema = Schema::builder()
+            .with_schema_id(target_schema.schema_id())
+            .with_fields(pruned.fields().to_vec())
+            .build()?;
+        let projected_schema = Arc::new(schema_to_arrow_schema(&pruned_schema)?);
+
+        let equality_ids = equality_ids.to_vec();
+        let mut source_fields_checked = !require_source_columns;
         let record_batch_stream = record_batch_stream.map(move |record_batch| {
-            record_batch.and_then(|record_batch| {
-                record_batch_transformer.process_record_batch(record_batch)
-            })
+            let record_batch = record_batch?;
+            if !source_fields_checked {
+                ensure_source_fields(&record_batch, &equality_ids, &target_schema)?;
+                source_fields_checked = true;
+            }
+            project_by_field_id(&record_batch, &projected_schema)
         });
 
         Ok(Box::pin(record_batch_stream) as ArrowRecordBatchStream)
     }
+}
+
+/// Projects `record_batch` onto `target`, matching fields at every nesting level by field
+/// id. Names are not used: after a rename, a nested sibling may be stored under the name a
+/// key field has now. A null struct makes all of its fields null, and a field the batch
+/// does not store is null.
+fn project_by_field_id(record_batch: &RecordBatch, target: &ArrowSchemaRef) -> Result<RecordBatch> {
+    let columns = project_fields(
+        record_batch.schema_ref().fields(),
+        record_batch.columns(),
+        None,
+        target.fields(),
+        record_batch.num_rows(),
+    )?;
+    Ok(RecordBatch::try_new_with_options(
+        target.clone(),
+        columns,
+        &RecordBatchOptions::new().with_row_count(Some(record_batch.num_rows())),
+    )?)
+}
+
+fn project_fields(
+    source_fields: &Fields,
+    source_columns: &[ArrayRef],
+    parent_nulls: Option<&NullBuffer>,
+    target_fields: &Fields,
+    num_rows: usize,
+) -> Result<Vec<ArrayRef>> {
+    target_fields
+        .iter()
+        .map(|target_field| {
+            let target_id = field_id(target_field)?;
+            let mut source_index = None;
+            for (index, source_field) in source_fields.iter().enumerate() {
+                if field_id(source_field)? == target_id {
+                    source_index = Some(index);
+                    break;
+                }
+            }
+            let Some(source_index) = source_index else {
+                return Ok(new_null_array(target_field.data_type(), num_rows));
+            };
+            let source = &source_columns[source_index];
+
+            let nulls = NullBuffer::union(parent_nulls, source.nulls());
+            match target_field.data_type() {
+                DataType::Struct(target_children) => {
+                    let source = source.as_struct_opt().ok_or_else(|| {
+                        Error::new(
+                            ErrorKind::DataInvalid,
+                            format!(
+                                "Field id {target_id:?} is a struct in the table schema but not in the delete file"
+                            ),
+                        )
+                    })?;
+                    let children = project_fields(
+                        source.fields(),
+                        source.columns(),
+                        nulls.as_ref(),
+                        target_children,
+                        num_rows,
+                    )?;
+                    Ok(Arc::new(StructArray::try_new_with_length(
+                        target_children.clone(),
+                        children,
+                        nulls,
+                        num_rows,
+                    )?) as ArrayRef)
+                }
+                data_type => {
+                    let column = if source.data_type() == data_type {
+                        source.clone()
+                    } else {
+                        cast(source, data_type)?
+                    };
+                    Ok(with_nulls(column, nulls)?)
+                }
+            }
+        })
+        .collect()
+}
+
+/// Adds `nulls` (typically the nulls of an enclosing struct) to the nulls of `array`. A
+/// field of a null struct reads as null, whatever value is stored for it.
+pub(crate) fn with_nulls(
+    array: ArrayRef,
+    nulls: Option<NullBuffer>,
+) -> std::result::Result<ArrayRef, ArrowError> {
+    match NullBuffer::union(nulls.as_ref(), array.nulls()) {
+        Some(nulls) if Some(&nulls) != array.nulls() => Ok(make_array(
+            array.to_data().into_builder().nulls(Some(nulls)).build()?,
+        )),
+        _ => Ok(array),
+    }
+}
+
+fn field_id(field: &Field) -> Result<Option<i32>> {
+    field
+        .metadata()
+        .get(PARQUET_FIELD_ID_META_KEY)
+        .map(|id| {
+            id.parse::<i32>().map_err(|e| {
+                Error::new(
+                    ErrorKind::DataInvalid,
+                    format!("field id not parseable as an i32: {e}"),
+                )
+            })
+        })
+        .transpose()
+}
+
+/// Fails if any of `field_ids` is not stored in `record_batch`.
+fn ensure_source_fields(
+    record_batch: &RecordBatch,
+    field_ids: &[i32],
+    target_schema: &Schema,
+) -> Result<()> {
+    let stored_ids = arrow_schema_to_schema(record_batch.schema().as_ref())?;
+    for &field_id in field_ids {
+        if stored_ids.field_by_id(field_id).is_none() {
+            let name = target_schema.name_by_field_id(field_id).unwrap_or_default();
+            return Err(Error::new(
+                ErrorKind::DataInvalid,
+                format!("Missing required source column for field {name} (id {field_id})"),
+            ));
+        }
+    }
+    Ok(())
 }
 
 #[async_trait::async_trait]
@@ -289,9 +458,10 @@ mod tests {
         let file_io = FileIO::new_with_fs();
 
         let arrow_schema = Arc::new(arrow_schema::Schema::new(vec![
-            arrow_schema::Field::new("id", arrow_schema::DataType::Int64, false).with_metadata(
-                HashMap::from([(PARQUET_FIELD_ID_META_KEY.to_string(), "1".to_string())]),
-            ),
+            Field::new("id", DataType::Int64, false).with_metadata(HashMap::from([(
+                PARQUET_FIELD_ID_META_KEY.to_string(),
+                "1".to_string(),
+            )])),
         ]));
 
         let id_col = Arc::new(Int64Array::from(vec![100i64, 200, 300]));

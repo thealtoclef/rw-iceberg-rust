@@ -601,7 +601,7 @@ impl CachingDeleteFileLoader {
 
             let root_array: ArrayRef = Arc::new(StructArray::from(record_batch));
 
-            let mut processor = EqDelColumnProcessor::new(&equality_ids);
+            let mut processor = EqDelColumnProcessor::new(&equality_ids, schema);
             visit_schema_with_partner(schema, &root_array, &mut processor, &accessor)?;
 
             // A missing or non-primitive equality column would silently widen the
@@ -670,13 +670,16 @@ impl CachingDeleteFileLoader {
 
 struct EqDelColumnProcessor<'a> {
     equality_ids: &'a HashSet<i32>,
+    /// Schema of the delete file batch, used to resolve full names of nested key columns.
+    schema: &'a Schema,
     collected_columns: Vec<(i32, ArrayRef, String, Type)>,
 }
 
 impl<'a> EqDelColumnProcessor<'a> {
-    fn new(equality_ids: &'a HashSet<i32>) -> Self {
+    fn new(equality_ids: &'a HashSet<i32>, schema: &'a Schema) -> Self {
         Self {
             equality_ids,
+            schema,
             collected_columns: Vec::with_capacity(equality_ids.len()),
         }
     }
@@ -741,10 +744,17 @@ impl SchemaWithPartnerVisitor<ArrayRef> for EqDelColumnProcessor<'_> {
 
     fn field(&mut self, field: &NestedFieldRef, partner: &ArrayRef, _value: ()) -> Result<()> {
         if self.equality_ids.contains(&field.id) && field.field_type.as_primitive_type().is_some() {
+            // A key nested in a struct is referenced by its full name (`s.f`): the leaf name
+            // alone would not bind, or would bind to a top-level column of the same name.
+            let name = self
+                .schema
+                .name_by_field_id(field.id)
+                .unwrap_or(&field.name)
+                .to_string();
             self.collected_columns.push((
                 field.id,
                 partner.clone(),
-                field.name.clone(),
+                name,
                 field.field_type.as_ref().clone(),
             ));
         }
@@ -891,7 +901,7 @@ mod tests {
         .await
         .expect("error parsing batch stream");
 
-        let expected = "((((((y IS NULL) OR (y != 1)) OR ((z IS NULL) OR (z != 100))) OR ((a IS NULL) OR (a != \"HELP\"))) OR ((sa IS NULL) OR (sa != 4))) OR ((b IS NULL) OR (b != 62696E6172795F64617461))) AND ((((((y IS NULL) OR (y != 2)) OR (z IS NOT NULL)) OR (a IS NOT NULL)) OR ((sa IS NULL) OR (sa != 5))) OR (b IS NOT NULL))".to_string();
+        let expected = "((((((y IS NULL) OR (y != 1)) OR ((z IS NULL) OR (z != 100))) OR ((a IS NULL) OR (a != \"HELP\"))) OR ((s.sa IS NULL) OR (s.sa != 4))) OR ((b IS NULL) OR (b != 62696E6172795F64617461))) AND ((((((y IS NULL) OR (y != 2)) OR (z IS NOT NULL)) OR (a IS NOT NULL)) OR ((s.sa IS NULL) OR (s.sa != 5))) OR (b IS NOT NULL))".to_string();
 
         assert_eq!(parsed_eq_delete.to_string(), expected);
     }
@@ -1469,6 +1479,199 @@ mod tests {
             .try_collect::<Vec<_>>()
             .await
             .expect_err("expected evolve to reject the missing equality column");
+        assert!(
+            err.to_string().contains("Missing required source column"),
+            "{err}"
+        );
+    }
+
+    fn nested_key_table_schema() -> SchemaRef {
+        Arc::new(
+            Schema::builder()
+                .with_schema_id(1)
+                .with_fields(vec![
+                    NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
+                    NestedField::optional(
+                        5,
+                        "s",
+                        Type::Struct(StructType::new(vec![
+                            NestedField::optional(6, "sa", Type::Primitive(PrimitiveType::Int))
+                                .into(),
+                            NestedField::optional(7, "sb", Type::Primitive(PrimitiveType::String))
+                                .into(),
+                        ])),
+                    )
+                    .into(),
+                ])
+                .build()
+                .unwrap(),
+        )
+    }
+
+    /// Writes an equality delete file holding a struct `s` (field id 5) with `children`.
+    fn write_struct_delete_file(
+        table_location: &str,
+        name: &str,
+        children: Vec<(Field, ArrayRef)>,
+    ) -> String {
+        let (fields, values): (Vec<_>, Vec<_>) = children.into_iter().unzip();
+        let struct_fields = Fields::from(fields);
+        let struct_array = StructArray::new(struct_fields.clone(), values, None);
+        let delete_schema = Arc::new(arrow_schema::Schema::new(vec![simple_field(
+            "s",
+            DataType::Struct(struct_fields),
+            true,
+            "5",
+        )]));
+        let batch = RecordBatch::try_new(delete_schema, vec![Arc::new(struct_array)]).unwrap();
+
+        let path = format!("{table_location}/{name}");
+        let mut writer =
+            ArrowWriter::try_new(File::create(&path).unwrap(), batch.schema(), None).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+        path
+    }
+
+    // An equality id may name a field nested in a struct; the delete file must load and its
+    // predicate must bind against the table schema by the full name.
+    #[tokio::test]
+    async fn test_equality_delete_on_struct_nested_field_loads() {
+        let tmp_dir = TempDir::new().unwrap();
+        let table_location = tmp_dir.path().as_os_str().to_str().unwrap();
+        let table_schema = nested_key_table_schema();
+
+        let path = write_struct_delete_file(table_location, "nested-eq-deletes.parquet", vec![(
+            simple_field("sa", DataType::Int32, true, "6"),
+            Arc::new(Int32Array::from(vec![4, 5])) as ArrayRef,
+        )]);
+        let eq_del = FileScanTaskDeleteFile::builder()
+            .with_file_path(path.clone())
+            .with_file_size_in_bytes(std::fs::metadata(&path).unwrap().len())
+            .with_file_type(DataContentType::EqualityDeletes)
+            .with_partition_spec_id(0)
+            .with_equality_ids(Some(vec![6]))
+            .build();
+        let file_scan_task = FileScanTask::builder()
+            .with_file_size_in_bytes(0)
+            .with_start(0)
+            .with_length(0)
+            .with_data_file_path(format!("{table_location}/data.parquet"))
+            .with_data_file_format(DataFileFormat::Parquet)
+            .with_schema(table_schema.clone())
+            .with_project_field_ids(vec![1])
+            .with_deletes(vec![eq_del])
+            .with_case_sensitive(true)
+            .build();
+
+        let delete_filter =
+            CachingDeleteFileLoader::new(FileIO::new_with_fs(), 10, Runtime::current())
+                .load_deletes(&file_scan_task.deletes, table_schema)
+                .await
+                .unwrap()
+                .expect("loading an equality delete on a nested field failed");
+
+        let predicate = delete_filter
+            .build_equality_delete_predicate(&file_scan_task)
+            .await
+            .expect("binding the nested equality delete predicate failed")
+            .expect("missing equality delete predicate");
+        assert_eq!(
+            predicate.to_string(),
+            "((s.sa IS NULL) OR (s.sa != 4)) AND ((s.sa IS NULL) OR (s.sa != 5))"
+        );
+    }
+
+    // Nested children are matched by field id. Here the delete file was written before field 6
+    // was renamed to `sa`, and its sibling (field 7) was then stored under the name `sa`: the
+    // key must still come from field 6.
+    #[tokio::test]
+    async fn test_equality_delete_on_renamed_nested_field_binds_by_id() {
+        let tmp_dir = TempDir::new().unwrap();
+        let table_location = tmp_dir.path().as_os_str().to_str().unwrap();
+        let table_schema = Arc::new(
+            Schema::builder()
+                .with_schema_id(1)
+                .with_fields(vec![
+                    NestedField::optional(
+                        5,
+                        "s",
+                        Type::Struct(StructType::new(vec![
+                            NestedField::optional(6, "sa", Type::Primitive(PrimitiveType::Int))
+                                .into(),
+                            NestedField::optional(7, "sb", Type::Primitive(PrimitiveType::Int))
+                                .into(),
+                        ])),
+                    )
+                    .into(),
+                ])
+                .build()
+                .unwrap(),
+        );
+
+        let path =
+            write_struct_delete_file(table_location, "renamed-nested-eq-deletes.parquet", vec![
+                (
+                    simple_field("old", DataType::Int32, true, "6"),
+                    Arc::new(Int32Array::from(vec![1, 2])) as ArrayRef,
+                ),
+                (
+                    simple_field("sa", DataType::Int32, true, "7"),
+                    Arc::new(Int32Array::from(vec![100, 200])) as ArrayRef,
+                ),
+            ]);
+        let basic_delete_file_loader =
+            BasicDeleteFileLoader::new(FileIO::new_with_fs(), ScanMetrics::new());
+        let batch_stream = basic_delete_file_loader
+            .parquet_to_batch_stream(&path, std::fs::metadata(&path).unwrap().len(), None)
+            .await
+            .unwrap();
+        let batches = BasicDeleteFileLoader::evolve_schema(batch_stream, table_schema, &[6], true)
+            .await
+            .unwrap()
+            .try_collect::<Vec<_>>()
+            .await
+            .unwrap();
+
+        let s = batches[0].column(0).as_struct();
+        assert_eq!(s.num_columns(), 1);
+        assert_eq!(s.fields()[0].name(), "sa");
+        assert_eq!(
+            s.column(0).as_primitive::<arrow_array::types::Int32Type>(),
+            &Int32Array::from(vec![1, 2])
+        );
+    }
+
+    // The struct holding a nested key being present is not enough: the key itself must be
+    // stored, or it would be materialized as null and delete every null row.
+    #[tokio::test]
+    async fn test_equality_delete_missing_nested_key_fails_evolve() {
+        let tmp_dir = TempDir::new().unwrap();
+        let table_location = tmp_dir.path().as_os_str().to_str().unwrap();
+
+        let path =
+            write_struct_delete_file(table_location, "missing-nested-eq-deletes.parquet", vec![(
+                simple_field("sb", DataType::Utf8, true, "7"),
+                Arc::new(StringArray::from(vec!["x"])) as ArrayRef,
+            )]);
+        let basic_delete_file_loader =
+            BasicDeleteFileLoader::new(FileIO::new_with_fs(), ScanMetrics::new());
+        let batch_stream = basic_delete_file_loader
+            .parquet_to_batch_stream(&path, std::fs::metadata(&path).unwrap().len(), None)
+            .await
+            .unwrap();
+
+        let err = BasicDeleteFileLoader::evolve_schema(
+            batch_stream,
+            nested_key_table_schema(),
+            &[6],
+            true,
+        )
+        .await
+        .unwrap()
+        .try_collect::<Vec<_>>()
+        .await
+        .expect_err("expected evolve to reject the missing nested equality column");
         assert!(
             err.to_string().contains("Missing required source column"),
             "{err}"
