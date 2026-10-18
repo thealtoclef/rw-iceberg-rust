@@ -23,26 +23,35 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use parquet::arrow::ProjectionMask;
-use parquet::arrow::arrow_reader::{ArrowPredicateFn, RowFilter, RowSelection};
+use arrow_array::cast::AsArray;
+use arrow_array::{Array, ArrayRef, RecordBatch};
+use arrow_schema::{ArrowError, DataType, Field, Fields, Schema as ArrowSchema};
+use parquet::arrow::arrow_reader::{ArrowPredicate, ArrowPredicateFn, RowSelection};
+use parquet::arrow::{PARQUET_FIELD_ID_META_KEY, ProjectionMask};
 use parquet::file::metadata::ParquetMetaData;
 use parquet::schema::types::SchemaDescriptor;
 
 use super::{ArrowReader, PredicateConverter};
+use crate::arrow::create_primitive_array_repeated;
+use crate::arrow::equality_delete_set::{EqDeleteSet, with_nulls};
+use crate::arrow::record_batch_transformer::constants_map;
 use crate::error::Result;
 use crate::expr::BoundPredicate;
 use crate::expr::visitors::bound_predicate_visitor::visit;
 use crate::expr::visitors::page_index_evaluator::PageIndexEvaluator;
 use crate::expr::visitors::row_group_metrics_evaluator::RowGroupMetricsEvaluator;
-use crate::spec::Schema;
+use crate::scan::FileScanTask;
+use crate::spec::{Datum, Literal, NestedFieldRef, PrimitiveLiteral, Schema, StructType, Type};
+use crate::{Error, ErrorKind};
 
 impl ArrowReader {
-    pub(super) fn get_row_filter(
+    /// Converts the scan predicate to an Arrow predicate for the Parquet `RowFilter`.
+    pub(super) fn get_arrow_predicate(
         predicates: &BoundPredicate,
         parquet_schema: &SchemaDescriptor,
         iceberg_field_ids: &HashSet<i32>,
         field_id_map: &HashMap<i32, usize>,
-    ) -> Result<RowFilter> {
+    ) -> Result<Box<dyn ArrowPredicate>> {
         // Collect Parquet column indices from field ids.
         // If the field id is not found in Parquet schema, it will be ignored due to schema evolution.
         let mut column_indices = iceberg_field_ids
@@ -62,8 +71,175 @@ impl ArrowReader {
         // creates the projection mask for the Arrow predicates.
         let projection_mask = ProjectionMask::leaves(parquet_schema, column_indices.clone());
         let predicate_func = visit(&mut converter, predicates)?;
-        let arrow_predicate = ArrowPredicateFn::new(projection_mask, predicate_func);
-        Ok(RowFilter::new(vec![Box::new(arrow_predicate)]))
+        Ok(Box::new(ArrowPredicateFn::new(
+            projection_mask,
+            predicate_func,
+        )))
+    }
+
+    /// Builds one Arrow predicate per equality delete set, keeping the rows whose key is not
+    /// in the set. Each predicate decodes only the set's key columns, and the `RowFilter`
+    /// drops deleted rows before the remaining columns are decoded.
+    ///
+    /// A key column the data file does not store is resolved with the spec's column
+    /// projection rules: the identity partition value, then the field's `initial-default`,
+    /// then null. A key nested in a struct is still null in the rows where an enclosing
+    /// struct is null. When no key column or enclosing struct is stored, the key is the same
+    /// for every row, so the set either deletes the whole file or nothing.
+    pub(super) fn get_equality_delete_predicates(
+        delete_sets: &[Arc<EqDeleteSet>],
+        task: &FileScanTask,
+        parquet_schema: &SchemaDescriptor,
+        file_schema: &ArrowSchema,
+        field_id_map: &HashMap<i32, usize>,
+    ) -> Result<Vec<Box<dyn ArrowPredicate>>> {
+        let mut partition_constants: Option<HashMap<i32, Datum>> = None;
+        let mut predicates: Vec<Box<dyn ArrowPredicate>> = Vec::with_capacity(delete_sets.len());
+
+        for delete_set in delete_sets {
+            let mut leaves = Vec::with_capacity(delete_set.fields().len());
+            let mut sources = Vec::with_capacity(delete_set.fields().len());
+            for field in delete_set.fields() {
+                if let Some(&leaf) = field_id_map.get(&field.field_id) {
+                    leaves.push(leaf);
+                    sources.push(EqDeleteKeySource::Column(
+                        parquet_schema.column(leaf).path().parts().to_vec(),
+                    ));
+                } else {
+                    let constants = match &mut partition_constants {
+                        Some(constants) => constants,
+                        None => partition_constants.insert(Self::partition_constants(task)?),
+                    };
+                    let value = Self::missing_column_value(task, constants, field.field_id);
+                    sources.push(Self::missing_key_source(
+                        task,
+                        field.field_id,
+                        value,
+                        file_schema,
+                        &mut leaves,
+                    ));
+                }
+            }
+
+            if leaves.is_empty() {
+                let columns = Self::eq_delete_key_columns(&sources, delete_set, None, 1)?;
+                if delete_set.keep_mask(&columns)?.value(0) {
+                    continue;
+                }
+            }
+            leaves.sort_unstable();
+            leaves.dedup();
+
+            let delete_set = delete_set.clone();
+            let predicate = move |batch: RecordBatch| {
+                let columns = Self::eq_delete_key_columns(
+                    &sources,
+                    &delete_set,
+                    Some(&batch),
+                    batch.num_rows(),
+                )
+                .map_err(|e| ArrowError::ExternalError(Box::new(e)))?;
+                delete_set.keep_mask(&columns)
+            };
+            predicates.push(Box::new(ArrowPredicateFn::new(
+                ProjectionMask::leaves(parquet_schema, leaves),
+                predicate,
+            )));
+        }
+
+        Ok(predicates)
+    }
+
+    fn partition_constants(task: &FileScanTask) -> Result<HashMap<i32, Datum>> {
+        match (&task.partition_spec, &task.partition) {
+            (Some(spec), Some(partition)) => constants_map(spec, partition, &task.schema),
+            _ => Ok(HashMap::new()),
+        }
+    }
+
+    /// The value every row reads for a column the data file does not store.
+    fn missing_column_value(
+        task: &FileScanTask,
+        partition_constants: &HashMap<i32, Datum>,
+        field_id: i32,
+    ) -> Option<PrimitiveLiteral> {
+        if let Some(datum) = partition_constants.get(&field_id) {
+            return Some(datum.literal().clone());
+        }
+        match task
+            .schema
+            .field_by_id(field_id)
+            .and_then(|field| field.initial_default.as_ref())
+        {
+            Some(Literal::Primitive(literal)) => Some(literal.clone()),
+            _ => None,
+        }
+    }
+
+    /// Resolves a key column the data file does not store. Its value is `value`, except in
+    /// the rows where an enclosing struct is null: the deepest enclosing struct the file
+    /// stores decides those rows, and one of its stored leaves is added to `leaves` so the
+    /// struct is decoded. The file stores a struct if its physical schema holds a field with
+    /// the struct's id, even when every child it stores was since dropped from the table
+    /// schema. An enclosing struct the file does not store either reads as its
+    /// `initial-default`, or as null when it has none, which makes the key null.
+    fn missing_key_source(
+        task: &FileScanTask,
+        field_id: i32,
+        value: Option<PrimitiveLiteral>,
+        file_schema: &ArrowSchema,
+        leaves: &mut Vec<usize>,
+    ) -> EqDeleteKeySource {
+        let ancestors = struct_ancestors(task.schema.as_struct(), field_id).unwrap_or_default();
+        let stored = stored_struct(file_schema.fields(), &ancestors);
+        let missing_from = stored.as_ref().map_or(0, |(depth, ..)| depth + 1);
+
+        if value.is_none()
+            || ancestors[missing_from..]
+                .iter()
+                .any(|ancestor| ancestor.initial_default.is_none())
+        {
+            return EqDeleteKeySource::Constant(None);
+        }
+        match stored {
+            Some((_, struct_path, leaf)) => {
+                leaves.push(leaf);
+                EqDeleteKeySource::ConstantInStruct { struct_path, value }
+            }
+            None => EqDeleteKeySource::Constant(value),
+        }
+    }
+
+    /// Materialises the key columns of `delete_set` for `num_rows` rows of `batch`.
+    fn eq_delete_key_columns(
+        sources: &[EqDeleteKeySource],
+        delete_set: &EqDeleteSet,
+        batch: Option<&RecordBatch>,
+        num_rows: usize,
+    ) -> Result<Vec<ArrayRef>> {
+        sources
+            .iter()
+            .zip(delete_set.fields())
+            .map(|(source, field)| match (source, batch) {
+                (EqDeleteKeySource::Column(path), Some(batch)) => column_by_path(batch, path),
+                (EqDeleteKeySource::Constant(literal), _) => {
+                    create_primitive_array_repeated(&field.data_type, literal, num_rows)
+                }
+                (EqDeleteKeySource::ConstantInStruct { struct_path, value }, Some(batch)) => {
+                    let struct_nulls = column_by_path(batch, struct_path)?.nulls().cloned();
+                    let column =
+                        create_primitive_array_repeated(&field.data_type, value, num_rows)?;
+                    Ok(with_nulls(column, struct_nulls)?)
+                }
+                (
+                    EqDeleteKeySource::Column(_) | EqDeleteKeySource::ConstantInStruct { .. },
+                    None,
+                ) => Err(Error::new(
+                    ErrorKind::Unexpected,
+                    "Equality delete key column requires a record batch",
+                )),
+            })
+            .collect()
     }
 
     pub(super) fn get_selected_row_group_indices(
@@ -207,6 +383,118 @@ impl ArrowReader {
 
         Ok(selected)
     }
+}
+
+/// Where the values of an equality delete key column come from in a data file.
+enum EqDeleteKeySource {
+    /// Names from the batch root down to the Parquet leaf column.
+    Column(Vec<String>),
+    /// The file does not store the column, so every row reads this value (`None` is null).
+    Constant(Option<PrimitiveLiteral>),
+    /// The file does not store the column but stores an enclosing struct: rows read `value`
+    /// where that struct is non-null, and null where it is null.
+    ConstantInStruct {
+        /// Names from the batch root down to the enclosing struct.
+        struct_path: Vec<String>,
+        value: Option<PrimitiveLiteral>,
+    },
+}
+
+/// The structs enclosing `field_id`, outermost first, or `None` if `field_id` is not reached
+/// through structs only.
+fn struct_ancestors(r#struct: &StructType, field_id: i32) -> Option<Vec<NestedFieldRef>> {
+    for field in r#struct.fields() {
+        if field.id == field_id {
+            return Some(Vec::new());
+        }
+        if let Type::Struct(child) = field.field_type.as_ref()
+            && let Some(mut ancestors) = struct_ancestors(child, field_id)
+        {
+            ancestors.insert(0, field.clone());
+            return Some(ancestors);
+        }
+    }
+    None
+}
+
+/// The deepest of `ancestors` (structs, outermost first) that the file stores, looked up by
+/// field id in the file's Arrow schema. Returns its depth, the names from the batch root down
+/// to it, and its first Parquet leaf column: Arrow leaves follow the Parquet column order.
+fn stored_struct(
+    file_fields: &Fields,
+    ancestors: &[NestedFieldRef],
+) -> Option<(usize, Vec<String>, usize)> {
+    let mut fields = file_fields;
+    let mut first_leaf = 0;
+    let mut path = Vec::with_capacity(ancestors.len());
+    let mut stored = None;
+
+    for (depth, ancestor) in ancestors.iter().enumerate() {
+        let mut found = None;
+        for field in fields {
+            if arrow_field_id(field) == Some(ancestor.id) {
+                found = Some(field);
+                break;
+            }
+            first_leaf += leaf_count(field.data_type());
+        }
+        let Some(field) = found else { break };
+        let DataType::Struct(children) = field.data_type() else {
+            break;
+        };
+        path.push(field.name().clone());
+        // A struct without stored leaves cannot be decoded, so its nulls are unknown.
+        if leaf_count(field.data_type()) > 0 {
+            stored = Some((depth, path.clone(), first_leaf));
+        }
+        fields = children;
+    }
+    stored
+}
+
+fn arrow_field_id(field: &Field) -> Option<i32> {
+    field
+        .metadata()
+        .get(PARQUET_FIELD_ID_META_KEY)?
+        .parse()
+        .ok()
+}
+
+/// The number of Parquet leaf columns that store a value of `data_type`.
+fn leaf_count(data_type: &DataType) -> usize {
+    match data_type {
+        DataType::Struct(fields) => fields.iter().map(|f| leaf_count(f.data_type())).sum(),
+        DataType::List(field)
+        | DataType::LargeList(field)
+        | DataType::ListView(field)
+        | DataType::LargeListView(field)
+        | DataType::FixedSizeList(field, _)
+        | DataType::Map(field, _) => leaf_count(field.data_type()),
+        _ => 1,
+    }
+}
+
+/// Extracts a (possibly struct-nested) leaf column from a `RowFilter` batch. A null parent
+/// struct makes the leaf null.
+fn column_by_path(batch: &RecordBatch, path: &[String]) -> Result<ArrayRef> {
+    let not_found = || {
+        Error::new(
+            ErrorKind::DataInvalid,
+            format!(
+                "Equality delete key column `{}` not found in data file",
+                path.join(".")
+            ),
+        )
+    };
+
+    let (root, rest) = path.split_first().ok_or_else(not_found)?;
+    let mut column = batch.column_by_name(root).ok_or_else(not_found)?.clone();
+    for name in rest {
+        let struct_array = column.as_struct_opt().ok_or_else(not_found)?;
+        let child = struct_array.column_by_name(name).ok_or_else(not_found)?;
+        column = with_nulls(child.clone(), struct_array.nulls().cloned())?;
+    }
+    Ok(column)
 }
 
 #[cfg(test)]
@@ -1294,5 +1582,485 @@ mod tests {
             vec![2, 4, 5],
             "positional deletes must be applied correctly even when page indexes are absent"
         );
+    }
+}
+
+#[cfg(test)]
+mod equality_delete_tests {
+    use std::collections::HashMap;
+    use std::fs::File;
+    use std::sync::Arc;
+
+    use arrow_array::cast::AsArray;
+    use arrow_array::types::Int64Type;
+    use arrow_array::{ArrayRef, Int32Array, Int64Array, RecordBatch, StringArray, StructArray};
+    use arrow_schema::{DataType, Field, Fields, Schema as ArrowSchema};
+    use futures::TryStreamExt;
+    use parquet::arrow::{ArrowWriter, PARQUET_FIELD_ID_META_KEY};
+    use tempfile::TempDir;
+
+    use crate::Runtime;
+    use crate::arrow::ArrowReaderBuilder;
+    use crate::expr::{Bind, Reference};
+    use crate::io::FileIO;
+    use crate::scan::{FileScanTask, FileScanTaskDeleteFile, FileScanTaskStream};
+    use crate::spec::{
+        DataContentType, DataFileFormat, Datum, Literal, NestedField, PrimitiveType, Schema,
+        SchemaRef, StructType, Type,
+    };
+
+    fn field(name: &str, data_type: DataType, field_id: i32) -> Field {
+        Field::new(name, data_type, true).with_metadata(HashMap::from([(
+            PARQUET_FIELD_ID_META_KEY.to_string(),
+            field_id.to_string(),
+        )]))
+    }
+
+    fn write_parquet(dir: &TempDir, name: &str, columns: Vec<(Field, ArrayRef)>) -> String {
+        let (fields, arrays): (Vec<_>, Vec<_>) = columns.into_iter().unzip();
+        let batch = RecordBatch::try_new(Arc::new(ArrowSchema::new(fields)), arrays).unwrap();
+        let path = format!("{}/{name}", dir.path().to_str().unwrap());
+        let mut writer =
+            ArrowWriter::try_new(File::create(&path).unwrap(), batch.schema(), None).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+        path
+    }
+
+    fn eq_delete(path: &str, equality_ids: Vec<i32>) -> FileScanTaskDeleteFile {
+        FileScanTaskDeleteFile::builder()
+            .with_file_path(path.to_string())
+            .with_file_size_in_bytes(std::fs::metadata(path).unwrap().len())
+            .with_file_type(DataContentType::EqualityDeletes)
+            .with_partition_spec_id(0)
+            .with_equality_ids(Some(equality_ids))
+            .build()
+    }
+
+    /// Reads `data_path` with the given deletes and returns the `id` column (field id 1).
+    async fn read_ids(
+        schema: SchemaRef,
+        data_path: &str,
+        deletes: Vec<FileScanTaskDeleteFile>,
+        predicate: Option<crate::expr::Predicate>,
+    ) -> Vec<i64> {
+        let task = FileScanTask::builder()
+            .with_file_size_in_bytes(std::fs::metadata(data_path).unwrap().len())
+            .with_start(0)
+            .with_length(0)
+            .with_data_file_path(data_path.to_string())
+            .with_data_file_format(DataFileFormat::Parquet)
+            .with_schema(schema.clone())
+            .with_project_field_ids(vec![1])
+            .with_predicate(predicate.map(|p| p.bind(schema, true).unwrap()))
+            .with_deletes(deletes)
+            .with_case_sensitive(true)
+            .build();
+
+        let reader = ArrowReaderBuilder::new(FileIO::new_with_fs(), Runtime::current()).build();
+        let tasks = Box::pin(futures::stream::iter(vec![Ok(task)])) as FileScanTaskStream;
+        let batches: Vec<RecordBatch> = reader
+            .read(tasks)
+            .unwrap()
+            .stream()
+            .try_collect()
+            .await
+            .unwrap();
+
+        batches
+            .iter()
+            .flat_map(|batch| {
+                batch
+                    .column(0)
+                    .as_primitive::<Int64Type>()
+                    .values()
+                    .to_vec()
+            })
+            .collect()
+    }
+
+    fn id_name_schema() -> SchemaRef {
+        Arc::new(
+            Schema::builder()
+                .with_fields(vec![
+                    NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
+                    NestedField::optional(2, "name", Type::Primitive(PrimitiveType::String)).into(),
+                ])
+                .build()
+                .unwrap(),
+        )
+    }
+
+    // Delete files on different key columns apply independently, a null delete value removes
+    // only null rows, and the scan predicate still applies alongside the deletes.
+    #[tokio::test]
+    async fn test_eq_deletes_with_scan_predicate() {
+        let dir = TempDir::new().unwrap();
+        let data = write_parquet(&dir, "data.parquet", vec![
+            (
+                field("id", DataType::Int64, 1),
+                Arc::new(Int64Array::from(vec![1, 2, 3, 4, 5, 6])) as ArrayRef,
+            ),
+            (
+                field("name", DataType::Utf8, 2),
+                Arc::new(StringArray::from(vec![
+                    Some("a"),
+                    None,
+                    Some("c"),
+                    Some("d"),
+                    Some("e"),
+                    Some("f"),
+                ])) as ArrayRef,
+            ),
+        ]);
+        let id_deletes = write_parquet(&dir, "id-deletes.parquet", vec![(
+            field("id", DataType::Int64, 1),
+            Arc::new(Int64Array::from(vec![4, 100])) as ArrayRef,
+        )]);
+        let name_deletes = write_parquet(&dir, "name-deletes.parquet", vec![(
+            field("name", DataType::Utf8, 2),
+            Arc::new(StringArray::from(vec![Some("e"), None])) as ArrayRef,
+        )]);
+
+        let ids = read_ids(
+            id_name_schema(),
+            &data,
+            vec![
+                eq_delete(&id_deletes, vec![1]),
+                eq_delete(&name_deletes, vec![2]),
+            ],
+            Some(Reference::new("id").greater_than(Datum::long(1))),
+        )
+        .await;
+        assert_eq!(ids, vec![3, 6]);
+    }
+
+    // Two delete files on the same key are merged; a composite key deletes a row only when
+    // every column matches.
+    #[tokio::test]
+    async fn test_eq_deletes_merged_and_composite_key() {
+        let dir = TempDir::new().unwrap();
+        let data = write_parquet(&dir, "data.parquet", vec![
+            (
+                field("id", DataType::Int64, 1),
+                Arc::new(Int64Array::from(vec![1, 2, 3, 4])) as ArrayRef,
+            ),
+            (
+                field("name", DataType::Utf8, 2),
+                Arc::new(StringArray::from(vec!["a", "b", "c", "d"])) as ArrayRef,
+            ),
+        ]);
+        let first = write_parquet(&dir, "first.parquet", vec![(
+            field("id", DataType::Int64, 1),
+            Arc::new(Int64Array::from(vec![1])) as ArrayRef,
+        )]);
+        let second = write_parquet(&dir, "second.parquet", vec![(
+            field("id", DataType::Int64, 1),
+            Arc::new(Int64Array::from(vec![2])) as ArrayRef,
+        )]);
+        let composite = write_parquet(&dir, "composite.parquet", vec![
+            (
+                field("id", DataType::Int64, 1),
+                Arc::new(Int64Array::from(vec![3, 4])) as ArrayRef,
+            ),
+            (
+                field("name", DataType::Utf8, 2),
+                Arc::new(StringArray::from(vec!["c", "x"])) as ArrayRef,
+            ),
+        ]);
+
+        let ids = read_ids(
+            id_name_schema(),
+            &data,
+            vec![
+                eq_delete(&first, vec![1]),
+                eq_delete(&composite, vec![1, 2]),
+                eq_delete(&second, vec![1]),
+            ],
+            None,
+        )
+        .await;
+        assert_eq!(ids, vec![4]);
+    }
+
+    // A data file written before an int -> long promotion still stores int32 keys.
+    #[tokio::test]
+    async fn test_eq_delete_on_promoted_column() {
+        let dir = TempDir::new().unwrap();
+        let data = write_parquet(&dir, "data.parquet", vec![(
+            field("id", DataType::Int32, 1),
+            Arc::new(Int32Array::from(vec![1, 2, 3])) as ArrayRef,
+        )]);
+        let deletes = write_parquet(&dir, "deletes.parquet", vec![(
+            field("id", DataType::Int64, 1),
+            Arc::new(Int64Array::from(vec![2])) as ArrayRef,
+        )]);
+
+        let ids = read_ids(
+            id_name_schema(),
+            &data,
+            vec![eq_delete(&deletes, vec![1])],
+            None,
+        )
+        .await;
+        assert_eq!(ids, vec![1, 3]);
+    }
+
+    // A key column the data file does not store reads as its `initial-default` for every row.
+    #[tokio::test]
+    async fn test_eq_delete_on_missing_column_uses_initial_default() {
+        let dir = TempDir::new().unwrap();
+        let schema = Arc::new(
+            Schema::builder()
+                .with_fields(vec![
+                    NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
+                    NestedField::optional(3, "b", Type::Primitive(PrimitiveType::Int))
+                        .with_initial_default(Literal::int(7))
+                        .into(),
+                ])
+                .build()
+                .unwrap(),
+        );
+        let data = write_parquet(&dir, "data.parquet", vec![(
+            field("id", DataType::Int64, 1),
+            Arc::new(Int64Array::from(vec![1, 2, 3])) as ArrayRef,
+        )]);
+        let b_is_7 = write_parquet(&dir, "b7.parquet", vec![(
+            field("b", DataType::Int32, 3),
+            Arc::new(Int32Array::from(vec![7])) as ArrayRef,
+        )]);
+        let b_is_8 = write_parquet(&dir, "b8.parquet", vec![(
+            field("b", DataType::Int32, 3),
+            Arc::new(Int32Array::from(vec![8])) as ArrayRef,
+        )]);
+        let id_2_b_7 = write_parquet(&dir, "id2b7.parquet", vec![
+            (
+                field("id", DataType::Int64, 1),
+                Arc::new(Int64Array::from(vec![2])) as ArrayRef,
+            ),
+            (
+                field("b", DataType::Int32, 3),
+                Arc::new(Int32Array::from(vec![7])) as ArrayRef,
+            ),
+        ]);
+
+        let read = |deletes| read_ids(schema.clone(), &data, deletes, None);
+        assert!(read(vec![eq_delete(&b_is_7, vec![3])]).await.is_empty());
+        assert_eq!(read(vec![eq_delete(&b_is_8, vec![3])]).await, vec![1, 2, 3]);
+        assert_eq!(read(vec![eq_delete(&id_2_b_7, vec![1, 3])]).await, vec![
+            1, 3
+        ]);
+    }
+
+    // A key nested in a struct is read through the struct, and a null parent struct makes the
+    // key null, so it matches a null delete value.
+    #[tokio::test]
+    async fn test_eq_delete_on_struct_nested_column() {
+        let dir = TempDir::new().unwrap();
+        let schema = Arc::new(
+            Schema::builder()
+                .with_fields(vec![
+                    NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
+                    NestedField::optional(
+                        5,
+                        "s",
+                        Type::Struct(StructType::new(vec![
+                            NestedField::optional(6, "sa", Type::Primitive(PrimitiveType::Int))
+                                .into(),
+                        ])),
+                    )
+                    .into(),
+                ])
+                .build()
+                .unwrap(),
+        );
+        let struct_fields = Fields::from(vec![field("sa", DataType::Int32, 6)]);
+        let struct_column = |values: Vec<Option<i32>>, nulls: Option<Vec<bool>>| {
+            Arc::new(StructArray::new(
+                struct_fields.clone(),
+                vec![Arc::new(Int32Array::from(values)) as ArrayRef],
+                nulls.map(Into::into),
+            )) as ArrayRef
+        };
+
+        let data = write_parquet(&dir, "data.parquet", vec![
+            (
+                field("id", DataType::Int64, 1),
+                Arc::new(Int64Array::from(vec![1, 2, 3])) as ArrayRef,
+            ),
+            (
+                field("s", DataType::Struct(struct_fields.clone()), 5),
+                struct_column(
+                    vec![Some(1), Some(2), Some(3)],
+                    Some(vec![true, false, true]),
+                ),
+            ),
+        ]);
+        let deletes = write_parquet(&dir, "deletes.parquet", vec![(
+            field("s", DataType::Struct(struct_fields.clone()), 5),
+            struct_column(vec![Some(1), None], None),
+        )]);
+
+        let ids = read_ids(schema, &data, vec![eq_delete(&deletes, vec![6])], None).await;
+        assert_eq!(ids, vec![3]);
+    }
+
+    // A nested key the data file does not store reads as its `initial-default`, but stays null
+    // where the enclosing struct is null; if the struct itself is not stored and has no
+    // default, the key is null in every row.
+    #[tokio::test]
+    async fn test_eq_delete_on_missing_nested_column_keeps_null_structs() {
+        let dir = TempDir::new().unwrap();
+        let schema = Arc::new(
+            Schema::builder()
+                .with_fields(vec![
+                    NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
+                    NestedField::optional(
+                        5,
+                        "s",
+                        Type::Struct(StructType::new(vec![
+                            NestedField::optional(6, "sa", Type::Primitive(PrimitiveType::Int))
+                                .into(),
+                            NestedField::optional(8, "key", Type::Primitive(PrimitiveType::Int))
+                                .with_initial_default(Literal::int(7))
+                                .into(),
+                        ])),
+                    )
+                    .into(),
+                ])
+                .build()
+                .unwrap(),
+        );
+        let struct_fields = Fields::from(vec![field("sa", DataType::Int32, 6)]);
+        let with_struct = write_parquet(&dir, "with-struct.parquet", vec![
+            (
+                field("id", DataType::Int64, 1),
+                Arc::new(Int64Array::from(vec![1, 2, 3])) as ArrayRef,
+            ),
+            (
+                field("s", DataType::Struct(struct_fields.clone()), 5),
+                Arc::new(StructArray::new(
+                    struct_fields,
+                    vec![Arc::new(Int32Array::from(vec![1, 2, 3])) as ArrayRef],
+                    Some(vec![true, false, true].into()),
+                )) as ArrayRef,
+            ),
+        ]);
+        let without_struct = write_parquet(&dir, "without-struct.parquet", vec![(
+            field("id", DataType::Int64, 1),
+            Arc::new(Int64Array::from(vec![1, 2, 3])) as ArrayRef,
+        )]);
+        let key_deletes = |name: &str, value: Option<i32>| {
+            let key_fields = Fields::from(vec![field("key", DataType::Int32, 8)]);
+            write_parquet(&dir, name, vec![(
+                field("s", DataType::Struct(key_fields.clone()), 5),
+                Arc::new(StructArray::new(
+                    key_fields,
+                    vec![Arc::new(Int32Array::from(vec![value])) as ArrayRef],
+                    None,
+                )) as ArrayRef,
+            )])
+        };
+        let key_is_7 = key_deletes("key7.parquet", Some(7));
+        let key_is_null = key_deletes("key-null.parquet", None);
+
+        for (data, deletes, expected) in [
+            (&with_struct, &key_is_7, vec![2]),
+            (&with_struct, &key_is_null, vec![1, 3]),
+            (&without_struct, &key_is_7, vec![1, 2, 3]),
+            (&without_struct, &key_is_null, vec![]),
+        ] {
+            let ids = read_ids(
+                schema.clone(),
+                data,
+                vec![eq_delete(deletes, vec![8])],
+                None,
+            )
+            .await;
+            assert_eq!(ids, expected, "{data} with {deletes}");
+        }
+    }
+
+    // The file stores the struct enclosing a missing nested key even when the only child it
+    // stores was since dropped from the table schema: that struct's nulls still decide which
+    // rows read the key's default.
+    #[tokio::test]
+    async fn test_eq_delete_on_missing_nested_column_with_dropped_sibling() {
+        let dir = TempDir::new().unwrap();
+        let schema = Arc::new(
+            Schema::builder()
+                .with_fields(vec![
+                    NestedField::required(1, "id", Type::Primitive(PrimitiveType::Long)).into(),
+                    NestedField::optional(
+                        5,
+                        "s",
+                        Type::Struct(StructType::new(vec![
+                            NestedField::optional(8, "key", Type::Primitive(PrimitiveType::Int))
+                                .with_initial_default(Literal::int(7))
+                                .into(),
+                        ])),
+                    )
+                    .into(),
+                ])
+                .build()
+                .unwrap(),
+        );
+        // `old_field` (id 9) was dropped from `s` after this file was written.
+        let struct_fields = Fields::from(vec![field("old_field", DataType::Int32, 9)]);
+        let data = write_parquet(&dir, "data.parquet", vec![
+            (
+                field("id", DataType::Int64, 1),
+                Arc::new(Int64Array::from(vec![1, 2])) as ArrayRef,
+            ),
+            (
+                field("s", DataType::Struct(struct_fields.clone()), 5),
+                Arc::new(StructArray::new(
+                    struct_fields,
+                    vec![Arc::new(Int32Array::from(vec![10, 20])) as ArrayRef],
+                    Some(vec![false, true].into()),
+                )) as ArrayRef,
+            ),
+        ]);
+        let key_fields = Fields::from(vec![field("key", DataType::Int32, 8)]);
+        let deletes = write_parquet(&dir, "deletes.parquet", vec![(
+            field("s", DataType::Struct(key_fields.clone()), 5),
+            Arc::new(StructArray::new(
+                key_fields,
+                vec![Arc::new(Int32Array::from(vec![7])) as ArrayRef],
+                None,
+            )) as ArrayRef,
+        )]);
+
+        let ids = read_ids(schema, &data, vec![eq_delete(&deletes, vec![8])], None).await;
+        assert_eq!(ids, vec![1]);
+    }
+
+    // `column_by_path` resolves a key through its parent structs; a null parent makes the
+    // key null.
+    #[test]
+    fn test_column_by_path_propagates_struct_nulls() {
+        let struct_fields = Fields::from(vec![Field::new("sa", DataType::Int32, true)]);
+        let struct_array = StructArray::new(
+            struct_fields.clone(),
+            vec![Arc::new(Int32Array::from(vec![1, 2, 3])) as ArrayRef],
+            Some(vec![true, false, true].into()),
+        );
+        let batch = RecordBatch::try_new(
+            Arc::new(ArrowSchema::new(vec![Field::new(
+                "s",
+                DataType::Struct(struct_fields),
+                true,
+            )])),
+            vec![Arc::new(struct_array) as ArrayRef],
+        )
+        .unwrap();
+
+        let column = super::column_by_path(&batch, &["s".to_string(), "sa".to_string()]).unwrap();
+        assert_eq!(
+            column.as_primitive::<arrow_array::types::Int32Type>(),
+            &Int32Array::from(vec![Some(1), None, Some(3)])
+        );
+
+        assert!(super::column_by_path(&batch, &["s".to_string(), "missing".to_string()]).is_err());
     }
 }

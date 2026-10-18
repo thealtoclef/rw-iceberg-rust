@@ -18,15 +18,14 @@
 use std::sync::Arc;
 
 use arrow_array::cast::AsArray;
-use arrow_array::{
-    Array, ArrayRef, RecordBatch, RecordBatchOptions, StructArray, make_array, new_null_array,
-};
+use arrow_array::{Array, ArrayRef, RecordBatch, RecordBatchOptions, StructArray, new_null_array};
 use arrow_buffer::NullBuffer;
 use arrow_cast::cast::cast;
-use arrow_schema::{ArrowError, DataType, Field, Fields, SchemaRef as ArrowSchemaRef};
+use arrow_schema::{DataType, Field, Fields, SchemaRef as ArrowSchemaRef};
 use futures::{StreamExt, TryStreamExt};
 use parquet::arrow::{PARQUET_FIELD_ID_META_KEY, ParquetRecordBatchStreamBuilder};
 
+use crate::arrow::equality_delete_set::with_nulls;
 use crate::arrow::reader::ParquetReadOptions;
 use crate::arrow::record_batch_transformer::RecordBatchTransformerBuilder;
 use crate::arrow::scan_metrics::ScanMetrics;
@@ -238,20 +237,6 @@ fn project_fields(
             }
         })
         .collect()
-}
-
-/// Adds `nulls` (typically the nulls of an enclosing struct) to the nulls of `array`. A
-/// field of a null struct reads as null, whatever value is stored for it.
-pub(crate) fn with_nulls(
-    array: ArrayRef,
-    nulls: Option<NullBuffer>,
-) -> std::result::Result<ArrayRef, ArrowError> {
-    match NullBuffer::union(nulls.as_ref(), array.nulls()) {
-        Some(nulls) if Some(&nulls) != array.nulls() => Ok(make_array(
-            array.to_data().into_builder().nulls(Some(nulls)).build()?,
-        )),
-        _ => Ok(array),
-    }
 }
 
 fn field_id(field: &Field) -> Result<Option<i32>> {

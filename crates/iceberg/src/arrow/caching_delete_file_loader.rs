@@ -23,18 +23,17 @@ use futures::{StreamExt, TryStreamExt};
 use tokio::sync::oneshot::{Receiver, channel};
 
 use super::delete_filter::{DeleteFilter, EqDelLoadGuard, PosDelLoadAction};
+use crate::arrow::arrow_schema_to_schema;
 use crate::arrow::delete_file_loader::BasicDeleteFileLoader;
+use crate::arrow::equality_delete_set::EqDeleteSet;
 use crate::arrow::scan_metrics::ScanMetrics;
-use crate::arrow::{arrow_primitive_to_literal, arrow_schema_to_schema};
 use crate::delete_vector::{DELETION_VECTOR_PROPERTY_REFERENCED_DATA_FILE, DeleteVector};
-use crate::expr::Predicate::AlwaysTrue;
-use crate::expr::{Predicate, Reference};
 use crate::io::{FileIO, InputFile};
 use crate::puffin::{Blob, DELETION_VECTOR_V1, PuffinReader};
 use crate::runtime::Runtime;
 use crate::scan::{ArrowRecordBatchStream, FileScanTaskDeleteFile};
 use crate::spec::{
-    DataContentType, DataFileFormat, Datum, ListType, MapType, NestedField, NestedFieldRef,
+    DataContentType, DataFileFormat, ListType, MapType, NestedField, NestedFieldRef,
     PartnerAccessor, PrimitiveType, Schema, SchemaRef, SchemaWithPartnerVisitor, StructType, Type,
     VariantType, visit_schema_with_partner,
 };
@@ -446,8 +445,8 @@ impl CachingDeleteFileLoader {
                         .await;
 
                 match result {
-                    Ok(predicate) => {
-                        load_guard.finish(predicate);
+                    Ok(delete_set) => {
+                        load_guard.finish(delete_set);
                         Ok(ParsedDeleteFileContext::EqDel)
                     }
                     Err(error) => {
@@ -578,8 +577,8 @@ impl CachingDeleteFileLoader {
     async fn parse_equality_deletes_record_batch_stream(
         mut stream: ArrowRecordBatchStream,
         equality_ids: HashSet<i32>,
-    ) -> Result<Predicate> {
-        let mut row_predicates = Vec::new();
+    ) -> Result<EqDeleteSet> {
+        let mut delete_set: Option<EqDeleteSet> = None;
         let mut batch_schema_iceberg: Option<Schema> = None;
         let accessor = EqDelRecordBatchPartnerAccessor;
 
@@ -587,7 +586,7 @@ impl CachingDeleteFileLoader {
             let record_batch = record_batch?;
 
             if record_batch.num_columns() == 0 {
-                return Ok(AlwaysTrue);
+                return Ok(EqDeleteSet::empty());
             }
 
             let schema = match &batch_schema_iceberg {
@@ -616,56 +615,45 @@ impl CachingDeleteFileLoader {
                 ));
             }
 
-            let mut datum_columns_with_names = processor.finish()?;
-            if datum_columns_with_names.is_empty() {
+            let mut columns = processor.finish()?;
+            if columns.is_empty() {
                 continue;
             }
+            // `EqDeleteSet` orders its key columns by field id.
+            columns.sort_by_key(|column| column.field_id);
 
-            // Iceberg spec (Equality Delete Files): a null data value never equals a non-null
-            // delete value, so a row with a null equality column must be kept. Build the keep
-            // predicate as `col IS NULL OR col != v` (`col IS NOT NULL` for a null delete value);
-            // a bare `col != v` drops nulls.
-            #[allow(clippy::len_zero)]
-            while datum_columns_with_names[0].0.len() > 0 {
-                let mut row_keep_predicate = Predicate::AlwaysFalse;
-                for &mut (ref mut column, ref field_name) in &mut datum_columns_with_names {
-                    if let Some(item) = column.next() {
-                        let reference = Reference::new(field_name.clone());
-                        let cell_keep_predicate = if let Some(datum) = item? {
-                            reference
-                                .clone()
-                                .is_null()
-                                .or(reference.not_equal_to(datum.clone()))
-                        } else {
-                            reference.is_not_null()
-                        };
-                        row_keep_predicate = row_keep_predicate.or(cell_keep_predicate);
-                    }
-                }
-                row_predicates.push(row_keep_predicate);
-            }
+            let delete_set = match &mut delete_set {
+                Some(delete_set) => delete_set,
+                None => delete_set.insert(EqDeleteSet::try_new(
+                    columns
+                        .iter()
+                        .map(|column| {
+                            (
+                                column.field_id,
+                                column.name.clone(),
+                                column.field_type.clone(),
+                            )
+                        })
+                        .collect(),
+                )?),
+            };
+            let arrays = columns
+                .into_iter()
+                .map(|column| column.array)
+                .collect::<Vec<_>>();
+            delete_set.insert_columns(&arrays)?;
         }
 
-        // All row predicates are combined to a single predicate by creating a balanced binary tree.
-        // Using a simple fold would result in a deeply nested predicate that can cause a stack overflow.
-        while row_predicates.len() > 1 {
-            let mut next_level = Vec::with_capacity(row_predicates.len().div_ceil(2));
-            let mut iter = row_predicates.into_iter();
-            while let Some(p1) = iter.next() {
-                if let Some(p2) = iter.next() {
-                    next_level.push(p1.and(p2));
-                } else {
-                    next_level.push(p1);
-                }
-            }
-            row_predicates = next_level;
-        }
-
-        match row_predicates.pop() {
-            Some(p) => Ok(p),
-            None => Ok(AlwaysTrue),
-        }
+        Ok(delete_set.unwrap_or_else(EqDeleteSet::empty))
     }
+}
+
+/// One equality column collected from an equality delete batch.
+struct EqDelColumn {
+    field_id: i32,
+    name: String,
+    field_type: PrimitiveType,
+    array: ArrayRef,
 }
 
 struct EqDelColumnProcessor<'a> {
@@ -693,45 +681,24 @@ impl<'a> EqDelColumnProcessor<'a> {
         missing
     }
 
-    #[allow(clippy::type_complexity)]
-    fn finish(
-        self,
-    ) -> Result<
-        Vec<(
-            Box<dyn ExactSizeIterator<Item = Result<Option<Datum>>>>,
-            String,
-        )>,
-    > {
+    fn finish(self) -> Result<Vec<EqDelColumn>> {
         self.collected_columns
             .into_iter()
-            .map(|(_, array, field_name, field_type)| {
-                let primitive_type = field_type
+            .map(|(field_id, array, name, field_type)| {
+                let field_type = field_type
                     .as_primitive_type()
                     .ok_or_else(|| {
                         Error::new(ErrorKind::Unexpected, "field is not a primitive type")
                     })?
                     .clone();
-
-                let lit_vec = arrow_primitive_to_literal(&array, &field_type)?;
-                let datum_iterator: Box<dyn ExactSizeIterator<Item = Result<Option<Datum>>>> =
-                    Box::new(lit_vec.into_iter().map(move |c| {
-                        c.map(|literal| {
-                            literal
-                                .as_primitive_literal()
-                                .map(|primitive_literal| {
-                                    Datum::new(primitive_type.clone(), primitive_literal)
-                                })
-                                .ok_or(Error::new(
-                                    ErrorKind::Unexpected,
-                                    "failed to convert to primitive literal",
-                                ))
-                        })
-                        .transpose()
-                    }));
-
-                Ok((datum_iterator, field_name))
+                Ok(EqDelColumn {
+                    field_id,
+                    name,
+                    field_type,
+                    array,
+                })
             })
-            .collect::<Result<Vec<_>>>()
+            .collect()
     }
 }
 
@@ -901,9 +868,36 @@ mod tests {
         .await
         .expect("error parsing batch stream");
 
-        let expected = "((((((y IS NULL) OR (y != 1)) OR ((z IS NULL) OR (z != 100))) OR ((a IS NULL) OR (a != \"HELP\"))) OR ((s.sa IS NULL) OR (s.sa != 4))) OR ((b IS NULL) OR (b != 62696E6172795F64617461))) AND ((((((y IS NULL) OR (y != 2)) OR (z IS NOT NULL)) OR (a IS NOT NULL)) OR ((s.sa IS NULL) OR (s.sa != 5))) OR (b IS NOT NULL))".to_string();
+        assert_eq!(parsed_eq_delete.len(), 2);
+        assert_eq!(
+            parsed_eq_delete
+                .fields()
+                .iter()
+                .map(|f| (f.field_id, f.name.as_str()))
+                .collect::<Vec<_>>(),
+            vec![(2, "y"), (3, "z"), (4, "a"), (6, "s.sa"), (8, "b")]
+        );
 
-        assert_eq!(parsed_eq_delete.to_string(), expected);
+        // Columns in field id order: y, z, a, sa, b. Row 0 and 3 are the delete keys; the
+        // others differ from a key in exactly one column (including null vs non-null).
+        let keep = keep_rows(&parsed_eq_delete, vec![
+            Arc::new(Int64Array::from(vec![1, 1, 2, 2])) as ArrayRef,
+            Arc::new(Int64Array::from(vec![Some(100), Some(100), Some(0), None])) as ArrayRef,
+            Arc::new(StringArray::from(vec![
+                Some("HELP"),
+                Some("HELP"),
+                None,
+                None,
+            ])) as ArrayRef,
+            Arc::new(Int32Array::from(vec![4, 5, 5, 5])) as ArrayRef,
+            Arc::new(BinaryArray::from(vec![
+                Some(&b"binary_data"[..]),
+                Some(&b"binary_data"[..]),
+                None,
+                None,
+            ])) as ArrayRef,
+        ]);
+        assert_eq!(keep, vec![false, true, true, false]);
     }
 
     // An equality delete keyed on a nullable column must not delete rows whose value in that
@@ -925,17 +919,19 @@ mod tests {
             .unwrap();
         let stream: ArrowRecordBatchStream = futures::stream::iter(vec![Ok(batch)]).boxed();
 
-        let predicate = CachingDeleteFileLoader::parse_equality_deletes_record_batch_stream(
+        let delete_set = CachingDeleteFileLoader::parse_equality_deletes_record_batch_stream(
             stream,
             HashSet::from_iter(vec![3]),
         )
         .await
         .expect("error parsing equality delete stream");
 
-        assert_eq!(
-            predicate.to_string(),
-            "(status IS NULL) OR (status != \"INACTIVE\")"
-        );
+        let keep = keep_rows(&delete_set, vec![Arc::new(StringArray::from(vec![
+            Some("INACTIVE"),
+            None,
+            Some("ACTIVE"),
+        ])) as ArrayRef]);
+        assert_eq!(keep, vec![false, true, true]);
     }
 
     // A delete row with a null value in the column matches only rows whose value is null (Iceberg
@@ -954,14 +950,18 @@ mod tests {
         .unwrap();
         let stream: ArrowRecordBatchStream = futures::stream::iter(vec![Ok(batch)]).boxed();
 
-        let predicate = CachingDeleteFileLoader::parse_equality_deletes_record_batch_stream(
+        let delete_set = CachingDeleteFileLoader::parse_equality_deletes_record_batch_stream(
             stream,
             HashSet::from_iter(vec![3]),
         )
         .await
         .expect("error parsing equality delete stream");
 
-        assert_eq!(predicate.to_string(), "status IS NOT NULL");
+        let keep = keep_rows(&delete_set, vec![Arc::new(StringArray::from(vec![
+            None,
+            Some("ACTIVE"),
+        ])) as ArrayRef]);
+        assert_eq!(keep, vec![false, true]);
     }
 
     // A delete row with several equality columns keeps a data row that differs in any one of them,
@@ -979,17 +979,18 @@ mod tests {
         .unwrap();
         let stream: ArrowRecordBatchStream = futures::stream::iter(vec![Ok(batch)]).boxed();
 
-        let predicate = CachingDeleteFileLoader::parse_equality_deletes_record_batch_stream(
+        let delete_set = CachingDeleteFileLoader::parse_equality_deletes_record_batch_stream(
             stream,
             HashSet::from_iter(vec![1, 3]),
         )
         .await
         .expect("error parsing equality delete stream");
 
-        assert_eq!(
-            predicate.to_string(),
-            "((id IS NULL) OR (id != 1)) OR ((status IS NULL) OR (status != \"X\"))"
-        );
+        let keep = keep_rows(&delete_set, vec![
+            Arc::new(Int64Array::from(vec![1, 1, 2])) as ArrayRef,
+            Arc::new(StringArray::from(vec![Some("X"), Some("Y"), Some("X")])) as ArrayRef,
+        ]);
+        assert_eq!(keep, vec![false, true, true]);
     }
 
     // A data row is kept only if it matches none of the delete rows, so the per-row keep
@@ -1009,17 +1010,19 @@ mod tests {
         .unwrap();
         let stream: ArrowRecordBatchStream = futures::stream::iter(vec![Ok(batch)]).boxed();
 
-        let predicate = CachingDeleteFileLoader::parse_equality_deletes_record_batch_stream(
+        let delete_set = CachingDeleteFileLoader::parse_equality_deletes_record_batch_stream(
             stream,
             HashSet::from_iter(vec![3]),
         )
         .await
         .expect("error parsing equality delete stream");
 
-        assert_eq!(
-            predicate.to_string(),
-            "((status IS NULL) OR (status != \"A\")) AND ((status IS NULL) OR (status != \"B\"))"
-        );
+        let keep = keep_rows(&delete_set, vec![Arc::new(StringArray::from(vec![
+            Some("A"),
+            Some("B"),
+            Some("C"),
+        ])) as ArrayRef]);
+        assert_eq!(keep, vec![false, false, true]);
     }
 
     #[tokio::test]
@@ -1086,9 +1089,8 @@ mod tests {
         .expect("skipping a cached failed load must not fail the load phase");
         let cached_error = tokio::time::timeout(
             Duration::from_secs(5),
-            late_filter.build_equality_delete_predicate(&make_data_file_task(
-                equality_delete_task.clone(),
-            )),
+            late_filter
+                .build_equality_delete_sets(&make_data_file_task(equality_delete_task.clone())),
         )
         .await
         .expect("cached equality delete failure lookup hung")
@@ -1119,15 +1121,23 @@ mod tests {
         .expect("delete loader task ended without a result")
         .expect("equality delete retry failed");
 
-        let predicate = tokio::time::timeout(
+        let delete_sets = tokio::time::timeout(
             Duration::from_secs(5),
-            delete_filter
-                .build_equality_delete_predicate(&make_data_file_task(equality_delete_task)),
+            delete_filter.build_equality_delete_sets(&make_data_file_task(equality_delete_task)),
         )
         .await
-        .expect("equality delete predicate build hung")
-        .expect("equality delete predicate build failed");
-        assert!(predicate.is_some());
+        .expect("equality delete set build hung")
+        .expect("equality delete set build failed");
+        assert_eq!(delete_sets.len(), 1);
+    }
+
+    fn keep_rows(delete_set: &EqDeleteSet, columns: Vec<ArrayRef>) -> Vec<bool> {
+        delete_set
+            .keep_mask(&columns)
+            .unwrap()
+            .values()
+            .iter()
+            .collect()
     }
 
     /// Create a simple field with metadata.
@@ -1571,15 +1581,19 @@ mod tests {
                 .unwrap()
                 .expect("loading an equality delete on a nested field failed");
 
-        let predicate = delete_filter
-            .build_equality_delete_predicate(&file_scan_task)
+        let delete_sets = delete_filter
+            .build_equality_delete_sets(&file_scan_task)
             .await
-            .expect("binding the nested equality delete predicate failed")
-            .expect("missing equality delete predicate");
-        assert_eq!(
-            predicate.to_string(),
-            "((s.sa IS NULL) OR (s.sa != 4)) AND ((s.sa IS NULL) OR (s.sa != 5))"
-        );
+            .unwrap();
+        assert_eq!(delete_sets.len(), 1);
+        assert_eq!(delete_sets[0].fields()[0].name, "s.sa");
+        let keep = keep_rows(&delete_sets[0], vec![Arc::new(Int32Array::from(vec![
+            Some(4),
+            Some(5),
+            Some(6),
+            None,
+        ])) as ArrayRef]);
+        assert_eq!(keep, vec![false, false, true, true]);
     }
 
     // Nested children are matched by field id. Here the delete file was written before field 6
@@ -1626,20 +1640,21 @@ mod tests {
             .parquet_to_batch_stream(&path, std::fs::metadata(&path).unwrap().len(), None)
             .await
             .unwrap();
-        let batches = BasicDeleteFileLoader::evolve_schema(batch_stream, table_schema, &[6], true)
-            .await
-            .unwrap()
-            .try_collect::<Vec<_>>()
+        let evolved = BasicDeleteFileLoader::evolve_schema(batch_stream, table_schema, &[6], true)
             .await
             .unwrap();
+        let delete_set = CachingDeleteFileLoader::parse_equality_deletes_record_batch_stream(
+            evolved,
+            HashSet::from([6]),
+        )
+        .await
+        .unwrap();
 
-        let s = batches[0].column(0).as_struct();
-        assert_eq!(s.num_columns(), 1);
-        assert_eq!(s.fields()[0].name(), "sa");
-        assert_eq!(
-            s.column(0).as_primitive::<arrow_array::types::Int32Type>(),
-            &Int32Array::from(vec![1, 2])
-        );
+        assert_eq!(delete_set.fields()[0].name, "s.sa");
+        let keep = keep_rows(&delete_set, vec![
+            Arc::new(Int32Array::from(vec![1, 2, 100, 200])) as ArrayRef,
+        ]);
+        assert_eq!(keep, vec![false, false, true, true]);
     }
 
     // The struct holding a nested key being present is not enough: the key itself must be
@@ -1774,11 +1789,11 @@ mod tests {
 
         // Verify both delete types can be processed together
         let result = delete_filter
-            .build_equality_delete_predicate(&file_scan_task)
+            .build_equality_delete_sets(&file_scan_task)
             .await;
         assert!(
             result.is_ok(),
-            "Failed to build equality delete predicate: {:?}",
+            "Failed to build equality delete sets: {:?}",
             result.err()
         );
     }
@@ -1822,13 +1837,14 @@ mod tests {
 
         let eq_ids = HashSet::from_iter(vec![2]);
 
-        let result = CachingDeleteFileLoader::parse_equality_deletes_record_batch_stream(
+        let delete_set = CachingDeleteFileLoader::parse_equality_deletes_record_batch_stream(
             record_batch_stream,
             eq_ids,
         )
-        .await;
+        .await
+        .unwrap();
 
-        assert!(result.is_ok());
+        assert_eq!(delete_set.len(), num_rows as usize);
     }
 
     #[tokio::test]
