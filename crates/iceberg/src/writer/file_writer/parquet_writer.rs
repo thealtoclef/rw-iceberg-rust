@@ -1127,7 +1127,7 @@ mod tests {
             let info = variant_group.get_basic_info();
 
             assert!(
-                matches!(info.logical_type_ref(), Some(LogicalType::Variant { .. })),
+                matches!(info.logical_type_ref(), Some(LogicalType::Variant(_))),
                 "variant group must carry LogicalType::Variant, got {:?}",
                 info.logical_type_ref()
             );

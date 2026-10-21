@@ -1076,9 +1076,7 @@ message schema {
             .unwrap();
         let variant = ParquetSchemaType::group_type_builder("v")
             .with_repetition(Repetition::REQUIRED)
-            .with_logical_type(Some(LogicalType::Variant {
-                specification_version: None,
-            }))
+            .with_logical_type(Some(LogicalType::variant(None)))
             .with_id(Some(1))
             .with_fields(vec![metadata.into(), value.into()])
             .build()
